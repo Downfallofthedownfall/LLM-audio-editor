@@ -45,6 +45,26 @@ FILLERS = {
 AHM = set()
 # 必然删除的无意义语气词（无歧义，直接删；其余交给 LLM 判断）
 CORE_FILLERS = {"um", "uh", "erm", "er", "em", "mm", "hmm", "ah", "oh", "uhh", "eh"}
+# 中文口癖/感叹语气词（无歧义、几乎总是可删；有语义的连接词如“那个/就是/然后”交给 LLM 判断）
+CORE_FILLERS_ZH = {
+    "嗯", "唔", "呃", "啊", "哦", "噢", "咦", "诶", "欸", "哎", "唉", "喔",
+    "呵", "嘿", "哈", "呐", "咯", "呜", "喂", "呸", "吓", "哎呀", "哎哟",
+    "嗯嗯", "啊啊", "哦哦", "嘻嘻",
+}
+# 中文语言码识别
+_ZH_LANGS = {"zh", "zh-cn", "zh-tw", "yue", "chi", "chinese"}
+
+
+def _core_fillers_for(language: str) -> Set[str]:
+    """按语言返回「必然删除」的语气词集合。"""
+    lang = str(language or "").strip().lower()
+    return CORE_FILLERS_ZH if lang in _ZH_LANGS else CORE_FILLERS
+
+
+def _norm_language(language: str) -> str:
+    """把语言码归一化成 Whisper 接受的 ISO 码：中文归 'zh'，其余归 'en'。"""
+    lang = str(language or "").strip().lower()
+    return "zh" if lang in _ZH_LANGS else "en"
 
 
 def _is_bracket_sound(w: str) -> bool:
@@ -101,7 +121,7 @@ def transcribe(audio_path: str, model_size: str = "large", device: Optional[str]
     clean["PATH"] = os.pathsep.join(pp)
 
     proc = subprocess.Popen(
-        ["py", "-3.14", script, audio_path, tmp, model_size],
+        ["py", "-3.14", script, audio_path, tmp, model_size, "30", "27", str(language)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", env=clean, bufsize=1,
     )
@@ -160,7 +180,11 @@ def transcribe(audio_path: str, model_size: str = "large", device: Optional[str]
 
 
 def _as_posix_clean(word: str) -> str:
-    return re.sub(r"[^a-z0-9']", "", word.lower())
+    """归一化成可比较的键：保留字母/数字/下划线/撇号以及中日韩等 Unicode 文字，
+    去掉空格和标点。中文（无空格分词）也按字符保留，避免被清空导致误判。"""
+    if not word:
+        return ""
+    return re.sub(r"[^\w']", "", word.lower())
 
 
 def rule_based_removes(tokens: List[Dict]) -> List[Tuple[float, float]]:
@@ -551,6 +575,43 @@ DEDUP_SYSTEM = (
     "only — no thinking block, no commentary."
 )
 
+# 中文判重规则（用于中文音频）
+DEDUP_RULES_ZH = (
+    "你是一名音频编辑，正在清理一段中文口播录音的错漏。转写以话语块（U1, U2, ...）展示，每个词/字单独一行，"
+    "格式为『GLOBAL_INDEX  词』。请判断哪些是必须删掉的口误/重复/无意义词，并返回它们的 GLOBAL_INDEX 编号。\n\n"
+    "如何判定『口误』（逐字分析哪些是口误/重复，只保留最后一版）：\n"
+    "核心规则——删前保后：同一句话或短语被说了不止一次（通常是说话人重新开始、重说或改口）时，保留最后一次"
+    "（通常是完整、正确、无误的版本），删掉所有更早的（被截断、更短或残缺的版本）。\n"
+    "明确的错误/重开标志：\n"
+    "  * 以破折号结尾的词（如『我—』『说—』）= 说话人话说一半被截断又重来 → 这个被截断的词与重开前的半句都是口误，删除。\n"
+    "  * 同一短语紧密重复，或只有细微差别（如『今天天气很好 今天天气很好』）→ 重说/口吃；只保留最后一版完整的，删掉更早的。\n"
+    "  * 不是完整、连贯句子的短片段 → 开场白/改口；删除。\n"
+    "总是删除（无意义）：\n"
+    "  * 感叹/语气词与纯声音：嗯、呃、啊、哦、噢、呀、哎、哎呀、哦哦、嗯嗯、哈哈 等，以及括号标注的声音如【咳嗽】【笑】【清嗓子】。\n"
+    "  * 连续重复的词（的的、我我、就是说就是说）：删掉更早的重复，保留一个。\n"
+    "绝不删除：\n"
+    "  * 完整、有语法、携带新信息的句子——即使它复用了常见词，或与某个已删片段提到同一话题。\n\n"
+    "要保守：只删你确信是口误的词；拿不准就保留。"
+    "只返回一个 JSON 数组，列出要删除的 GLOBAL_INDEX 编号，例如 [0,1,2,5,10,11,12,15]。"
+    "没有要删的就返回 []。只输出 JSON，不要解释。"
+)
+
+# 系统提示：让模型直接、简洁地返回 JSON（中文）
+DEDUP_SYSTEM_ZH = (
+    "你是一名精确的音频编辑助手。你会收到一段口播逐词转写，每个词/字单独一行，格式为『GLOBAL_INDEX  词』。"
+    "你唯一的任务是判断哪些词是『口误』必须删除，然后用一个紧凑的 JSON 数组返回它们的编号。"
+    "直接、简洁地工作：不要一步步推理，不要解释，不要引用或复述转写，除了最后的 JSON 什么都不要输出。"
+    "立刻用 JSON 回复——不要思考块，不要任何评论。"
+)
+
+
+def _dedup_prompts(language: str):
+    """按语言返回 (规则, 系统提示) 两段判重 prompt。"""
+    lang = str(language or "").strip().lower()
+    if lang in _ZH_LANGS:
+        return DEDUP_RULES_ZH, DEDUP_SYSTEM_ZH
+    return DEDUP_RULES, DEDUP_SYSTEM
+
 
 def _win_lines(words: List[Dict], a: int, b: int) -> List[str]:
     """把 words[a:b] 格式化为按话语分组的每词一行（左为全局索引、右为词）。"""
@@ -652,14 +713,20 @@ def _completion_text(client, model: str, messages: List[Dict], api_mode: str = "
 
 
 def llm_dedup_words(words: List[Dict], api_url: str, model: str, api_key: str,
-                    timeout: int = 600, progress=None, api_mode: str = "auto") -> List[int]:
+                    timeout: int = 600, progress=None, api_mode: str = "auto",
+                    language: str = "en") -> List[int]:
     """调用 OpenAI 兼容接口（chat.completions / responses）分窗判重。
 
     每窗约 WIN 词 + LOOK 回看上下文，多窗并行。可在 api_mode 中指定使用的端点类型
-    （auto 会自动在 chat.completions 与 responses 之间回退）。返回要删除的全局词索引数组。"""
+    （auto 会自动在 chat.completions 与 responses 之间回退），并根据 language 选择
+    英文/中文判重 prompt。返回要删除的全局词索引数组。"""
     n = len(words)
     if n == 0:
         return []
+    rules, system_prompt = _dedup_prompts(language)
+    ctx_note = ("... (上面是上一窗口的上下文，仅供参考；也可判为口误删除) ..."
+                if language in _ZH_LANGS else
+                "... (above is the previous window's context, for reference only; may also be judged a mistake) ...")
     WIN, LOOK = 500, 70
     windows = []
     a = 0
@@ -682,13 +749,13 @@ def llm_dedup_words(words: List[Dict], api_url: str, model: str, api_key: str,
         ctx, b, acpt = w
         lines = _win_lines(words, ctx, b)
         if ctx < acpt:
-            lines = ["... (above is the previous window's context, for reference only; may also be judged a mistake) ..."] + lines
+            lines = [ctx_note] + lines
         readable = "\n".join(lines)
         _dbg("==== window (accepted %d-%d) ====\n%s" % (acpt, b, "\n".join(lines[:25])))
-        user_prompt = (DEDUP_RULES + "\n\n---\n\nTRANSCRIPT (each word on its own line; the LEFT number is that "
+        user_prompt = (rules + "\n\n---\n\nTRANSCRIPT (each word on its own line; the LEFT number is that "
                        "word's GLOBAL index):\n" + readable +
                        "\n\nReturn ONLY a JSON object {\"indices\":[...]} listing the GLOBAL index numbers to DELETE.")
-        messages = [{"role": "system", "content": DEDUP_SYSTEM},
+        messages = [{"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}]
         content = _completion_text(client, model, messages, api_mode=api_mode, json_mode=True)
         if not content:
@@ -943,6 +1010,7 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
                 seg_gap: float = 0.3, pause_dur: float = 0.25, progress=None,
                 api_mode: str = "auto") -> Dict:
     """去重：只保留有文字的段落(词所在区域)，再减去 LLM 判重标记的词；无文字(静音)自然被切掉。"""
+    language = _norm_language(language)
     total_dur = _audio_duration(audio_path)
     _dbg("==== process start ====")
     _dbg("source total duration = %.2f s (ffprobe)" % total_dur)
@@ -960,11 +1028,13 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     del_set: Set[int] = set()
     if use_llm and api_key and api_url and model:
         _report(progress, 0.7, "LLM dedup: analyzing words window by window…")
-        llm_indices = llm_dedup_words(words, api_url, model, api_key, progress=progress, api_mode=api_mode)
+        llm_indices = llm_dedup_words(words, api_url, model, api_key, progress=progress,
+                                     api_mode=api_mode, language=language)
         # 保险：无意义声音标记 + 纯语气词必然删（即使 LLM 漏判）
+        core = _core_fillers_for(language)
         auto = set()
         for i, w in enumerate(words):
-            if _is_bracket_sound(w["word"]) or _as_posix_clean(w["word"]) in CORE_FILLERS:
+            if _is_bracket_sound(w["word"]) or _as_posix_clean(w["word"]) in core:
                 auto.add(i)
         del_idx = sorted(set(llm_indices) | auto)
         del_set = set(del_idx)
@@ -1008,7 +1078,9 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--api-mode", choices=["auto", "chat", "responses"], default="auto")
+    ap.add_argument("--language", default="en")
     ap.add_argument("--whisper", default="base")
     a = ap.parse_args()
-    info = dedup_audio(a.audio, a.out, a.api_url, a.model, a.api_key, a.whisper, api_mode=a.api_mode)
+    info = dedup_audio(a.audio, a.out, a.api_url, a.model, a.api_key, a.whisper,
+                       language=a.language, api_mode=a.api_mode)
     print(json.dumps(info, indent=2))

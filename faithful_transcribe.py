@@ -2,7 +2,7 @@
 # 在全局 Python 3.14（有 CUDA torch）运行，用 CrisperWhisper verbatim 转写。
 # 先 ffmpeg 解码为 16k mono WAV，再分块（30s 窗 + 重叠）逐段转写，实时把进度打到 stdout
 # （供 dedup.py 流式推给 UI），避免长音频像卡住。
-# 用法: py -3.14 faithful_transcribe.py <audio> <out.json> [model_size] [chunk_sec] [stride_sec]
+# 用法: py -3.14 faithful_transcribe.py <audio> <out.json> [model_size] [chunk_sec] [stride_sec] [language]
 import sys, os, json, time, subprocess, tempfile
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-cache"))
@@ -16,6 +16,9 @@ out = sys.argv[2]
 model_size = sys.argv[3] if len(sys.argv) > 3 else "large"
 CHUNK = float(sys.argv[4]) if len(sys.argv) > 4 else 30.0
 STRIDE = float(sys.argv[5]) if len(sys.argv) > 5 else 27.0  # 3s 重叠（避免边界丢词）
+LANG = sys.argv[6] if len(sys.argv) > 6 else "en"
+if LANG in ("auto", "", "none", "None"):
+    LANG = "en"
 
 import numpy as np
 from crisperwhisper.audio import load_audio, SAMPLE_RATE
@@ -75,7 +78,7 @@ while off < total - 0.001:
         break
     seg = y[s:e]
     try:
-        res = model.transcribe(seg, sr=SAMPLE_RATE, language="en",
+        res = model.transcribe(seg, sr=SAMPLE_RATE, language=LANG,
                                word_timestamps=True, mode="verbatim")
     except Exception as ex:
         print("WARN chunk failed@%.1f: %r" % (off, str(ex)[:200]), flush=True)

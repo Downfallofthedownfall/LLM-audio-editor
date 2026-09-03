@@ -86,7 +86,6 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
 ### 1. Server virtual environment
 
 ```powershell
-cd F:\whisper
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
@@ -116,7 +115,7 @@ Gyan.FFmpeg`).
 ### 4. Download the model
 
 The first run downloads the CrisperWhisper model (e.g. `CrisperWhisper2.0_large`) into
-`HF_HOME` (`F:\whisper\.hf-cache`). Afterwards it is loaded **offline**.
+`HF_HOME`. Afterwards it is loaded **offline**.
 
 ---
 
@@ -139,7 +138,6 @@ The first run downloads the CrisperWhisper model (e.g. `CrisperWhisper2.0_large`
 Double-click `start.bat` (creates the venv-backed server and opens the browser), or run:
 
 ```powershell
-cd F:\whisper
 .\.venv\Scripts\python.exe server.py
 ```
 
@@ -173,7 +171,7 @@ Then open **http://127.0.0.1:7861**.
 ## Project layout
 
 ```
-F:\whisper\
+Root Folder
   server.py              # Flask web server + SSE progress + upload/static
   dedup.py               # dedup engine: transcription orchestration, LLM dedup,
                          #   keep-block building, splice, AAF/EDL/FCPXML export

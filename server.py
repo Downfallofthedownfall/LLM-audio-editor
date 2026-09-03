@@ -81,6 +81,10 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <option value="chat">Chat Completions</option>
    <option value="responses">Responses</option>
  </select>
+ <label>Audio language</label><select name="language">
+   <option value="en" selected>English</option>
+   <option value="zh">中文 (Chinese)</option>
+ </select>
  <div class="row">
    <div><label>Whisper model</label>
      <select name="whisper"><option value="large" selected>large (default, most accurate)</option><option value="small">small (faster)</option></select>
@@ -163,6 +167,9 @@ def dedup():
     out_format = request.form.get("out_format", "auto")
     out_bitrate = request.form.get("out_bitrate", "320k")
     use_llm = request.form.get("use_llm") == "1"
+    language = request.form.get("language", "en").strip() or "en"
+    if language not in ("en", "zh"):
+        language = "en"
     outname = request.form.get("outname", "")
 
     if api_mode not in ("auto", "chat", "responses"):
@@ -189,7 +196,7 @@ def dedup():
     def worker():
         try:
             info = dedup_audio(tmp, out_path, api_url=api_url, model=model, api_key=api_key,
-                               whisper_model=whisper, language="en", keep_gap=keep_gap,
+                               whisper_model=whisper, language=language, keep_gap=keep_gap,
                                use_llm=use_llm, api_mode=api_mode, out_format=out_format, out_bitrate=out_bitrate,
                                seg_gap=seg_gap, pause_dur=pause_dur, progress=_progress)
             with _jobs_lock:
