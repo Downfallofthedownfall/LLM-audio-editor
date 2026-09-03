@@ -605,6 +605,11 @@ def _strip_json_fences(content: str) -> str:
     return s.strip()
 
 
+# 控制 Responses API 的思考强度：none=关闭思考；minimal/low=低强度；medium/high=高强度
+# 关思考(none)会导致模型逐个词乱删（碎片化、choppy），故用 low（低强度，仍快且删得连贯）
+REASONING_EFFORT = "low"
+
+
 def _completion_text(client, model: str, messages: List[Dict], api_mode: str = "auto",
                      json_mode: bool = False) -> str:
     """向任意 OpenAI 兼容端点发送消息并返回助手文本。
@@ -612,12 +617,16 @@ def _completion_text(client, model: str, messages: List[Dict], api_mode: str = "
     api_mode：
       "chat"       -> 只用 chat.completions
       "responses"  -> 只用 Responses API
-      "auto"       -> 先试 chat.completions，失败再试 Responses
+      "auto"       -> 先试 Responses API，失败再回退 chat.completions
     json_mode=True 时会请求结构化 JSON 输出；若提供方拒绝该参数则自动回退到纯文本，
-    调用方再负责从文本中解析 JSON。不发送任何提供方特有的参数（如 DeepSeek 的 thinking/reasoning）。
+    调用方再负责从文本中解析 JSON。
+
+    对 Responses API 额外发送 reasoning.effort（默认 none = 关闭思考模式），避免
+    deepseek-v4 系列默认开启高强度思考导致回答被路由到 reasoning_content（content 为空）
+    或又慢又费 token。
     """
     modes = {"chat": ["chat"], "responses": ["responses"],
-             "auto": ["chat", "responses"]}.get(api_mode, ["chat", "responses"])
+             "auto": ["responses", "chat"]}.get(api_mode, ["responses", "chat"])
     json_flags = [True, False] if json_mode else [False]
     for mode in modes:
         for want_json in json_flags:
@@ -630,6 +639,7 @@ def _completion_text(client, model: str, messages: List[Dict], api_mode: str = "
                     txt = (getattr(resp.choices[0].message, "content", "") or "").strip()
                 else:
                     kwargs = dict(model=model, input=messages)
+                    kwargs["reasoning"] = {"effort": REASONING_EFFORT}
                     if want_json:
                         kwargs["text"] = {"format": {"type": "json_object"}}
                     resp = client.responses.create(**kwargs)
@@ -875,9 +885,12 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
 
     被删的词会在中途切断块（不跨越删除区合并），因此被删的整段——连同它周边的
     微秒残响——都不会出现在输出里，避免脏残留 / 咔哒声。保留块内部保留 <=keep_gap
-    的自然停顿，并在块边缘加 pad 以便干净剪切（pad 只加在保留块上，被删区不会因此回归）。
+    的自然停顿，并在块边缘加 pad 以便干净剪切。关键是：**pad 不会越过相邻被删词
+    的边界**（clamp 到被删词的 start/end），所以被删口误的边缘残响不会被带回来
+    （消除"pad 截断"声）。最后合并因 pad 而相接/重叠的块。
     """
     blocks: List[Tuple[float, float]] = []
+    del_spans: List[Tuple[float, float]] = []
     cur_s = cur_e = None
     for i, w in enumerate(words):          # words 已是时间顺序
         s, e = float(w["start"]), float(w["end"])
@@ -886,6 +899,7 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
             if cur_s is not None:
                 blocks.append((cur_s, cur_e))
                 cur_s = cur_e = None
+            del_spans.append((s, e))
             continue
         if cur_s is None:
             cur_s, cur_e = s, e
@@ -896,7 +910,31 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
             cur_s, cur_e = s, e
     if cur_s is not None:
         blocks.append((cur_s, cur_e))
-    return [(max(0.0, s - pad), e + pad) for s, e in blocks if e - s > 0.02]
+    del_spans.sort()
+    import bisect
+    padded: List[Tuple[float, float]] = []
+    for s, e in blocks:
+        if e - s <= 0.02:
+            continue
+        ps, pe = max(0.0, s - pad), e + pad
+        # 左侧最近的被删词（end < s）：pad 起点不低于它的结尾
+        i1 = bisect.bisect_left(del_spans, (s, float("-inf"))) - 1
+        if i1 >= 0:
+            ps = max(ps, del_spans[i1][1])
+        # 右侧最近的被删词（start > e）：pad 终点不越过它的开头
+        i2 = bisect.bisect_right(del_spans, (e, float("inf")))
+        if i2 < len(del_spans):
+            pe = min(pe, del_spans[i2][0])
+        if pe > ps:
+            padded.append((ps, pe))
+    # 合并因 pad 而相接/重叠的相邻块，避免拼接时同一段被重复（叠音/没对齐）
+    merged: List[Tuple[float, float]] = []
+    for s, e in padded:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
 
 
 def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key: str,
