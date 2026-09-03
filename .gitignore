@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+
+# Model / package caches
+.hf-cache/
+.uv-cache/
+
+# Generated output (deduped audio, AAF, debug logs, temp files)
+output/
+
+# Third-party source checkouts / nested git repos (not this project's code)
+CrisperWhisper/
+pyaaf2_src/
+videocut/
+
+# Test / sample assets
+jfk.flac
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/

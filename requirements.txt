@@ -1,0 +1,23 @@
+# ---------------------------------------------------------------------------
+# Audio Dedup - web server and dedup-engine dependencies
+#
+#   Install into the virtual environment with:
+#       pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+Flask>=3.0
+openai>=1.60
+pydub>=0.25
+pyaaf2>=1.7
+numpy>=2.0
+
+# ---------------------------------------------------------------------------
+# Transcription does NOT run in this environment.
+#
+# faithful_transcribe.py runs as a subprocess in a SEPARATE Python
+# interpreter that has a CUDA-enabled PyTorch build (e.g. a global
+# Python 3.14 + torch 2.12+cu132). It requires:
+#
+#   torch, transformers, crisperwhisper, librosa, soundfile, soxr, numpy
+#
+# plus a system ffmpeg / ffprobe on PATH. See README.md for the exact setup.
+# ---------------------------------------------------------------------------
