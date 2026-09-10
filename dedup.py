@@ -1020,8 +1020,8 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     _dbg("words = %d; first = %.2f-%.2f; last = %.2f-%.2f"
          % (len(words), words[0]["start"], words[0]["end"], words[-1]["start"], words[-1]["end"]))
 
-    # 只有文字段落：词相邻(gap<0.4s)合并成块；无文字(静音/空白)区域自然被排除（仅用于日志参考）
-    text_blocks = speech_blocks(words, keep_gap=0.4)
+    # 只有文字段落：词相邻(gap<=keep_gap)合并成块；无文字(静音/空白)区域自然被排除（仅用于日志参考）
+    text_blocks = speech_blocks(words, keep_gap=keep_gap)
     _dbg("text blocks (has text) = %d: %s" % (len(text_blocks), [(round(s,2), round(e,2)) for s,e in text_blocks[:30]]))
     _dbg("text total = %.2f s (of %.2f total)" % (sum(e-s for s,e in text_blocks), total_dur))
 
@@ -1042,8 +1042,8 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
              % (len(llm_indices), len(auto),
                 [(round(words[i]['start'],2), round(words[i]['end'],2)) for i in del_idx]))
 
-    # 直接从「保留词」构建保留块：被删的词整段消失、不留 pad 残响
-    keep = clean_keep_blocks(words, del_set, keep_gap=0.4, pad=0.06)
+    # 直接从「保留词」构建保留块：被删的词整段消失、不留 pad 残响；keep_gap 用前端设置控制切分强度
+    keep = clean_keep_blocks(words, del_set, keep_gap=keep_gap, pad=0.06)
     _dbg("keep blocks after LLM = %d: %s" % (len(keep), [(round(s,2), round(e,2)) for s,e in keep[:40]]))
     if not keep:
         raise RuntimeError("Nothing left after filtering.")

@@ -89,7 +89,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div><label>Whisper model</label>
      <select name="whisper"><option value="large" selected>large (default, most accurate)</option><option value="small">small (faster)</option></select>
    </div>
-   <div><label>Silence gap (seconds, larger = more aggressive removal)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
+   <div><label>Silence gap (seconds, larger = keep more pauses, cut less)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
     <div><label>Pause split sensitivity (seconds, smaller = more granular)</label><input name="pause_dur" type="number" value="0.25" step="0.05" min="0.1" max="1.5"></div>
     
  </div>
