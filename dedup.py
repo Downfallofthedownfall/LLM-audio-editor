@@ -3,7 +3,7 @@
   1) faster-whisper 转写英文（带词级/句级时间戳）
   2) 规则去重：连续重复词、口癖词（精确、无需模型）
   3) 可选 LLM(OpenAI 兼容，任意 chat.completions / responses 端点) 判定冗余/重复句，返回需删除的段落区间
-  4) pydub 按区间剪切并拼接，输出干净音频
+  4) ffmpeg 流式解码 → 只保留选中区间 → 流式编码，内存占用与时长无关
 """
 import os, json, re, tempfile, traceback, glob
 import sys, threading, datetime
@@ -80,8 +80,18 @@ def _report(progress, frac: float, msg: str):
             pass
 
 
-_LOG_FILE = os.path.join(_HERE, "output", "debug.log")
+# 中间文件和日志都放在 .work，output 里只留最终结果
+WORK_DIR = os.path.join(_HERE, ".work")
+_LOG_FILE = os.path.join(WORK_DIR, "debug.log")
 _dbg_lock = threading.Lock()
+# 管道每次读写的大小：拼接时的内存占用由它决定，与音频时长无关
+_PIPE_CHUNK = 1 << 20
+
+
+def new_job_dir() -> str:
+    """为一次处理新建中间文件目录，调用方负责在结束时删除。"""
+    os.makedirs(WORK_DIR, exist_ok=True)
+    return tempfile.mkdtemp(prefix="job_", dir=WORK_DIR)
 
 
 def _dbg(msg):
@@ -101,7 +111,7 @@ def _dbg(msg):
 
 
 def transcribe(audio_path: str, model_size: str = "large", device: Optional[str] = None,
-               language: str = "en", progress=None) -> List[Dict]:
+               language: str = "en", progress=None, *, work_dir: str) -> List[Dict]:
     """用 CrisperWhisper verbatim 转写（全局 Python 3.14 + torch），返回词级 token 列表。
 
     子进程分块转写并实时把 STAGE/PROGRESS 打到 stdout，本函数用 Popen + 读线程
@@ -110,8 +120,7 @@ def transcribe(audio_path: str, model_size: str = "large", device: Optional[str]
     import subprocess, json as _json, threading
     here = os.path.dirname(os.path.abspath(__file__))
     script = os.path.join(here, "faithful_transcribe.py")
-    tmp = os.path.join(here, "output", "_faithful_words.json")
-    os.makedirs(os.path.dirname(tmp), exist_ok=True)
+    tmp = os.path.join(work_dir, "words.json")
     _report(progress, 0.08, f"Loading CrisperWhisper ({model_size}, verbatim)…")
     _dbg("faithful transcribe (streaming) via global py-3.14, model=%s" % model_size)
     # 清掉 PATH 里的 nvidia cu12 目录（避免全局 torch cu132 误用 venv 的 cuDNN 12）
@@ -134,12 +143,12 @@ def transcribe(audio_path: str, model_size: str = "large", device: Optional[str]
             if not line:
                 continue
             _dbg("[transcribe] " + line)
-            if line.startswith("STAGE LOADING"):
+            if line.startswith("STAGE LOADING_AUDIO"):
+                _report(progress, f0 + 0.03, "Extracting audio (large videos take a few minutes)…")
+            elif line.startswith("STAGE LOADING"):
                 _report(progress, f0, f"Loading CrisperWhisper ({model_size}, verbatim)…")
             elif line.startswith("STAGE LOADED"):
                 _report(progress, f0 + 0.02, "Model loaded, ready to transcribe…")
-            elif line.startswith("STAGE LOADING_AUDIO"):
-                _report(progress, f0 + 0.03, "Reading audio…")
             elif line.startswith("STAGE AUDIO"):
                 _report(progress, f0 + 0.04, "Audio parsed, starting chunked transcription…")
             elif line.startswith("PROGRESS"):
@@ -443,15 +452,18 @@ def _ffprobe(path: str) -> Dict:
     try:
         out = json.loads(subprocess.check_output(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate",
+             "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate,bits_per_sample,bits_per_raw_sample",
              "-of", "json", path]))
         s = (out.get("streams") or [{}])[0]
         meta = {"codec_name": s.get("codec_name", "").lower(),
                 "sample_rate": s.get("sample_rate") or "44100",
                 "channels": s.get("channels") or "2",
-                "bit_rate": s.get("bit_rate") or ""}
+                "bit_rate": s.get("bit_rate") or "",
+                "bits_per_sample": s.get("bits_per_sample") or 0,
+                "bits_per_raw_sample": s.get("bits_per_raw_sample") or 0}
     except Exception:
-        meta = {"codec_name": "", "sample_rate": "44100", "channels": "2", "bit_rate": ""}
+        meta = {"codec_name": "", "sample_rate": "44100", "channels": "2", "bit_rate": "",
+                "bits_per_sample": 0, "bits_per_raw_sample": 0}
     try:
         fmt = json.loads(subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -463,15 +475,27 @@ def _ffprobe(path: str) -> Dict:
 
 
 def _audio_duration(path: str) -> float:
-    """优先用 ffprobe 的时长（长文件/视频更可靠），失败则回退 pydub。"""
+    """优先用 ffprobe 的时长；容器里没有时长时流式解码并计数，不把音频读进内存。"""
+    import subprocess
     d = _ffprobe(path).get("duration")
     if d:
         try:
             return float(d)
         except Exception:
             pass
-    from pydub import AudioSegment
-    return len(AudioSegment.from_file(path)) / 1000.0
+    proc = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0", "-vn",
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "8000", "-ac", "1", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    size = 0
+    while True:
+        buf = proc.stdout.read(_PIPE_CHUNK)
+        if not buf:
+            break
+        size += len(buf)
+    if proc.wait() != 0 or not size:
+        raise RuntimeError("Cannot read an audio stream from: " + path)
+    return size / 16000.0
 
 
 def _resolve_output(out_format: str, src_codec: str, src_bit: str, user_bit: str):
@@ -494,47 +518,134 @@ def _resolve_output(out_format: str, src_codec: str, src_bit: str, user_bit: str
     return "wav", "pcm_s16le", None, True
 
 
-def _splice_keep(audio_path: str, keep_blocks: List[Tuple[float, float]], out_wav: str,
-                 out_format: str = "auto", out_bitrate: str = "256k") -> None:
-    """用 pydub 只保留说话片段并拼接，保留原始采样率/声道，编码匹配源。"""
-    from pydub import AudioSegment
+_EXT_BY_FORMAT = {"wav": ".wav", "flac": ".flac", "mp3": ".mp3", "mp4": ".m4a"}
+
+
+def output_extension(audio_path: str, out_format: str) -> str:
+    """输出文件的真实扩展名（out_format 为 auto 时由音频源决定）。"""
+    meta = _ffprobe(audio_path)
+    fmt = _resolve_output(out_format, meta.get("codec_name", ""), meta.get("bit_rate", "") or "", "")[0]
+    return _EXT_BY_FORMAT[fmt]
+
+
+def _pcm_bits(meta: Dict) -> int:
+    """解码用的位深：无损源保持原位深，有损源（ffprobe 报 0）用 16 位。"""
+    bits = 0
+    for key in ("bits_per_raw_sample", "bits_per_sample"):
+        try:
+            bits = max(bits, int(meta.get(key) or 0))
+        except (TypeError, ValueError):
+            pass
+    return 16 if bits <= 16 else 24 if bits <= 24 else 32
+
+
+def _splice_keep(audio_path: str, keep_blocks: List[Tuple[float, float]], out_path: str,
+                 out_format: str = "auto", out_bitrate: str = "256k", *,
+                 work_dir: str, progress=None) -> None:
+    """流式拼接：ffmpeg 解码到管道，只把保留区间写给另一个 ffmpeg 编码。
+
+    全程只在内存里保留一个 _PIPE_CHUNK，不会把整条音轨读进内存，长视频也一样；
+    保留原始采样率/声道。先写到 work_dir，成功后才移到 out_path。
+    """
+    import subprocess, shutil
 
     meta = _ffprobe(audio_path)
-    src_codec = meta.get("codec_name", "")
-    src_bit = meta.get("bit_rate", "") or ""
-    fmt, codec, bitrate, lossless = _resolve_output(out_format, src_codec, src_bit, out_bitrate)
+    fmt, codec, bitrate, _ = _resolve_output(
+        out_format, meta.get("codec_name", ""), meta.get("bit_rate", "") or "", out_bitrate)
+    sr = int(meta.get("sample_rate") or 44100)
+    ch = int(meta.get("channels") or 2)
+    bits = _pcm_bits(meta)
+    if fmt == "flac":
+        bits = min(bits, 24)  # ffmpeg 的 flac 编码器不支持 32 位
+    pcm = f"s{bits}le"
+    if fmt == "wav":
+        codec = f"pcm_{pcm}"
+    frame_size = ch * bits // 8
 
-    audio = AudioSegment.from_file(audio_path)
-    total_ms = len(audio)
-    sr = audio.frame_rate
-    ch = audio.channels
-    total_dur = total_ms / 1000.0
-    parts = []
-    for s, e in keep_blocks:
-        s_ms = int(max(0, min(float(s), total_dur)) * 1000)
-        e_ms = int(max(0, min(float(e), total_dur)) * 1000)
+    total_dur = float(meta.get("duration") or 0) or float("inf")
+    spans = []
+    for s, e in sorted(keep_blocks):
+        s_ms = int(max(0.0, min(float(s), total_dur)) * 1000)
+        e_ms = int(max(0.0, min(float(e), total_dur)) * 1000)
         if e_ms - s_ms > 40:
-            parts.append(audio[s_ms:e_ms])
-    if not parts:
+            spans.append((int(s_ms * (sr / 1000.0)), int(e_ms * (sr / 1000.0))))
+    if not spans:
         raise RuntimeError("No speech content found.")
-    _dbg(f"splice: blocks={len(parts)}, audio_dur={total_dur:.2f}s, blocks(first40)={[(round(s,2),round(e,2)) for s,e in keep_blocks][:40]}")
-    out = parts[0]
-    for p in parts[1:]:
-        out = out + p
+    _dbg(f"splice: blocks={len(spans)}, audio_dur={total_dur:.2f}s, blocks(first40)={[(round(s,2),round(e,2)) for s,e in keep_blocks][:40]}")
 
-    params = ["-ar", str(sr), "-ac", str(ch)]
-    if fmt == "mp3":
-        out.export(out_wav, format="mp3", bitrate=bitrate or "256k", parameters=params)
-    elif fmt == "flac":
-        out.export(out_wav, format="flac", parameters=params)
-    elif fmt == "mp4":  # aac/m4a
-        out.export(out_wav, format="mp4", bitrate=bitrate or "256k",
-                   parameters=params + ["-strict", "experimental"])
-    else:
-        out.export(out_wav, format="wav", parameters=params)
-    out_dur = _ffprobe(out_wav).get("duration")
+    part = os.path.join(work_dir, "splice.part")
+    dec_log_path = os.path.join(work_dir, "splice_decode.log")
+    enc_log_path = os.path.join(work_dir, "splice_encode.log")
+
+    def _log_tail(path: str) -> str:
+        with open(path, encoding="utf-8", errors="replace") as lf:
+            return lf.read()[-300:]
+
+    with open(dec_log_path, "wb") as dec_log, open(enc_log_path, "wb") as enc_log:
+        dec = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-v", "error", "-i", audio_path, "-map", "0:a:0", "-vn",
+             "-f", pcm, "-acodec", f"pcm_{pcm}", "-ar", str(sr), "-ac", str(ch), "-"],
+            stdout=subprocess.PIPE, stderr=dec_log)
+        enc = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", pcm, "-ar", str(sr), "-ac", str(ch), "-i", "-",
+             "-c:a", codec] + (["-b:a", str(bitrate)] if bitrate else []) + ["-f", fmt, part],
+            stdin=subprocess.PIPE, stderr=enc_log)
+
+        def _pump(size: int, sink) -> int:
+            """从解码管道读 size 字节，写给 sink；sink 为 None 时丢弃。返回实际读到的字节数。"""
+            moved = 0
+            while moved < size:
+                buf = dec.stdout.read(min(_PIPE_CHUNK, size - moved))
+                if not buf:
+                    break
+                if sink is not None:
+                    sink.write(buf)
+                moved += len(buf)
+            return moved
+
+        written = 0
+        pos = 0
+        last_pct = -1
+        end_frame = max(e for _, e in spans)
+        try:
+            for start, end in spans:
+                start = max(start, pos)
+                if end <= start:
+                    continue
+                want_skip = (start - pos) * frame_size
+                want_keep = (end - start) * frame_size
+                got_skip = _pump(want_skip, None)
+                got_keep = _pump(want_keep, enc.stdin) if got_skip == want_skip else 0
+                written += got_keep
+                pos = end
+                if got_skip < want_skip or got_keep < want_keep:  # 音频流比区间短
+                    if dec.wait() != 0:
+                        raise RuntimeError("ffmpeg decode failed: " + _log_tail(dec_log_path))
+                    break
+                pct = int(100 * pos / end_frame)
+                if pct != last_pct:
+                    last_pct = pct
+                    _report(progress, 0.93 + 0.06 * pct / 100, f"Splicing… {pct}%")
+            enc.stdin.close()
+            enc_rc = enc.wait()
+        except OSError:  # 编码器提前退出（Windows 上写断开的管道可能报 EINVAL 而不是 EPIPE）
+            enc.kill()
+            enc_rc = enc.wait() or -1
+        finally:
+            dec.kill()
+            dec.wait()
+            dec.stdout.close()
+            if enc.poll() is None:
+                enc.kill()
+                enc.wait()
+    if enc_rc != 0:
+        raise RuntimeError("ffmpeg encode failed: " + _log_tail(enc_log_path))
+    if not written:
+        raise RuntimeError("No audio could be read for the kept segments: " + _log_tail(dec_log_path))
+    shutil.move(part, out_path)
+    out_dur = _ffprobe(out_path).get("duration")
     _dbg(f"output duration = {out_dur} s")
-    print(f"[ok] saved clean audio: {out_wav} ({sr}Hz, {ch}ch, {fmt} {bitrate or 'lossless'})")
+    print(f"[ok] saved clean audio: {out_path} ({sr}Hz, {ch}ch, {fmt} {bitrate or 'lossless'})")
 
 
 DEDUP_RULES = (
@@ -847,7 +958,7 @@ def export_aaf(audio_path: str, keep_blocks: List[Tuple[float, float]], out_aaf:
         raise RuntimeError("No keep blocks for aaf.")
     if total_dur is None:
         total_dur = _audio_duration(audio_path)
-    url = "file:///" + urllib.parse.quote(os.path.abspath(audio_path).replace("\\", "/"))
+    url = "file:///" + urllib.parse.quote(os.path.abspath(audio_path).replace("\\", "/"), safe="/:")
     src_name = os.path.basename(audio_path)
     total_samples = int(total_dur * sr)
     with aaf2.open(out_aaf, "w") as f:
@@ -1008,13 +1119,13 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
                 whisper_model: str = "base", language: str = "en", keep_gap: float = 0.8,
                 use_llm: bool = False, out_format: str = "auto", out_bitrate: str = "256k",
                 seg_gap: float = 0.3, pause_dur: float = 0.25, progress=None,
-                api_mode: str = "auto") -> Dict:
+                api_mode: str = "auto", *, work_dir: str) -> Dict:
     """去重：只保留有文字的段落(词所在区域)，再减去 LLM 判重标记的词；无文字(静音)自然被切掉。"""
     language = _norm_language(language)
     total_dur = _audio_duration(audio_path)
     _dbg("==== process start ====")
     _dbg("source total duration = %.2f s (ffprobe)" % total_dur)
-    words = transcribe(audio_path, whisper_model, language=language, progress=progress)
+    words = transcribe(audio_path, whisper_model, language=language, progress=progress, work_dir=work_dir)
     if not words:
         raise RuntimeError("Transcription returned no words.")
     _dbg("words = %d; first = %.2f-%.2f; last = %.2f-%.2f"
@@ -1048,7 +1159,8 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     if not keep:
         raise RuntimeError("Nothing left after filtering.")
     _report(progress, 0.93, f"Splicing ({out_format})…")
-    _splice_keep(audio_path, keep, out_wav, out_format=out_format, out_bitrate=out_bitrate)
+    _splice_keep(audio_path, keep, out_wav, out_format=out_format, out_bitrate=out_bitrate,
+                 work_dir=work_dir, progress=progress)
     aaf_path = os.path.splitext(out_wav)[0] + ".aaf"
     try:
         export_aaf(audio_path, keep, aaf_path)
@@ -1081,6 +1193,11 @@ if __name__ == "__main__":
     ap.add_argument("--language", default="en")
     ap.add_argument("--whisper", default="base")
     a = ap.parse_args()
-    info = dedup_audio(a.audio, a.out, a.api_url, a.model, a.api_key, a.whisper,
-                       language=a.language, api_mode=a.api_mode)
+    import shutil
+    job_dir = new_job_dir()
+    try:
+        info = dedup_audio(a.audio, a.out, a.api_url, a.model, a.api_key, a.whisper,
+                           language=a.language, api_mode=a.api_mode, work_dir=job_dir)
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
     print(json.dumps(info, indent=2))

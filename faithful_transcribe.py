@@ -21,7 +21,8 @@ if LANG in ("auto", "", "none", "None"):
     LANG = "en"
 
 import numpy as np
-from crisperwhisper.audio import load_audio, SAMPLE_RATE
+import soundfile as sf
+from crisperwhisper.audio import SAMPLE_RATE
 
 
 def fail(msg):
@@ -46,7 +47,7 @@ wav = os.path.join(workdir, "_faithful_decode.wav")
 print("STAGE LOADING_AUDIO", flush=True)
 try:
     r = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", audio,
+        ["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", audio, "-map", "0:a:0",
          "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", wav],
         capture_output=True, text=True, timeout=1800,
     )
@@ -55,12 +56,9 @@ try:
 except Exception as e:
     fail("ffmpeg decode error: %r" % (str(e)[:300]))
 
-y = load_audio(wav)          # soundfile 读取，16k mono float32
-total = len(y) / float(SAMPLE_RATE)
-try:
-    os.remove(wav)
-except OSError:
-    pass
+wav_file = sf.SoundFile(wav)  # 不整体载入：转写时每次只读当前这一块到内存
+total_frames = wav_file.frames
+total = total_frames / float(SAMPLE_RATE)
 print("STAGE AUDIO %.1f" % total, flush=True)
 
 if total <= 0.5:
@@ -73,10 +71,11 @@ n_est = max(1, int(np.ceil(total / STRIDE)))
 off = 0.0
 while off < total - 0.001:
     s = int(round(off * SAMPLE_RATE))
-    e = min(len(y), int(round((off + CHUNK) * SAMPLE_RATE)))
+    e = min(total_frames, int(round((off + CHUNK) * SAMPLE_RATE)))
     if e - s < SAMPLE_RATE:
         break
-    seg = y[s:e]
+    wav_file.seek(s)
+    seg = wav_file.read(e - s, dtype="float32", always_2d=False)
     try:
         res = model.transcribe(seg, sr=SAMPLE_RATE, language=LANG,
                                word_timestamps=True, mode="verbatim")
@@ -90,6 +89,12 @@ while off < total - 0.001:
     off += STRIDE
     n += 1
     print("PROGRESS %d %d" % (n, n_est), flush=True)
+
+wav_file.close()
+try:
+    os.remove(wav)
+except OSError:
+    pass
 
 if not all_words:
     fail("no words transcribed (chunks=%d, warns=%d)" % (n, warns))

@@ -44,7 +44,7 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
                                                                         │
                         clean_keep_blocks ──▶ kept blocks (no residue)
                                                                         │
-                pydub splice ──▶ out.wav   +   pyaaf2 ──▶ out.aaf (Premiere)
+         ffmpeg streaming splice ──▶ out.wav   +   pyaaf2 ──▶ out.aaf (Premiere)
 ```
 
 - **Transcription** runs in a separate Python interpreter that has a CUDA PyTorch.
@@ -90,7 +90,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-This installs Flask, openai, pydub, pyaaf2, and numpy.
+This installs Flask, openai, pyaaf2, and numpy.
 
 ### 2. Transcription environment (CUDA PyTorch, separate interpreter)
 
@@ -145,7 +145,9 @@ Then open **http://127.0.0.1:7861**.
 
 ### In the web UI
 
-1. Select your audio/video file.
+1. Enter the **local file path** (e.g. `F:\videos\talk.mp4`) or choose a file to upload.
+   Use the path for large files: the source is read in place, with no upload or copy,
+   and it is never modified or deleted.
 2. Fill in the DeepSeek **API URL**, **model name**, and **API key**.
 3. Choose the **Whisper model** (`large` default) and output settings.
 4. Optionally enable **"Use DeepSeek to remove mis-speaks"**.
@@ -155,7 +157,8 @@ Then open **http://127.0.0.1:7861**.
 ### AAF in Premiere Pro
 
 - Import the `.aaf` file.
-- It references the **original source file** (a single source). Relink it if prompted.
+- It references the **original source file** (a single source) when you used the local
+  path. An uploaded file is deleted after processing, so relink it by name when prompted.
 - The timeline shows each kept segment as an independent clip for easy manual correction.
 
 ---
@@ -164,7 +167,12 @@ Then open **http://127.0.0.1:7861**.
 
 - **`wav` / `flac`** — lossless, preserving the source sample rate and channels.
 - **`mp3`** — high-bitrate (default 320k) compressed.
+- **`m4a`** — AAC, when "Match source" is selected and the source audio is AAC.
 - **`.aaf`** — Premiere Pro sequence (all kept segments, referencing the source).
+
+`output\` contains only these finished results. Intermediate files, temp files and the
+debug log live in `.work\`; each job's files are removed when it ends, and anything left
+by a forced shutdown is removed the next time the server starts.
 
 ---
 
@@ -194,13 +202,13 @@ Root Folder
   model is fully cached in `HF_HOME`.
 - **LLM returns nothing / "empty reply"** — the reasoning model ate the token budget.
   The tool disables `thinking` and does not set a small token limit; if a window still
-  fails it automatically falls back to a simpler call. Check `output\debug.log` for the
+  fails it automatically falls back to a simpler call. Check `.work\debug.log` for the
   `window ... -> added N` lines.
 - **Clicks / residue at cut points** — fixed by building keep blocks from kept words
   only, so deleted segments (including their padding) are removed entirely.
 - **Slow on long files** — the transformers backend is slower than CTranslate2 on
   Windows; the tool chunk-transcribes and streams progress so it is never "stuck".
-- **Debug log** — look in `output\debug.log` for transcription, LLM replies, and the
+- **Debug log** — look in `.work\debug.log` for transcription, LLM replies, and the
   final keep/delete ranges.
 
 ---

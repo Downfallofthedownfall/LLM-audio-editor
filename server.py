@@ -4,8 +4,9 @@
 - 可选 LLM(OpenAI 兼容, 任意 chat.completions / responses 端点) 智能判重
 - 输出可选 wav（无损）/ mp3（高码率）
 """
-import os, uuid, json, time, re, threading, traceback
+import os, uuid, json, time, re, threading, traceback, shutil, tempfile, glob
 import sys
+from urllib.parse import urlsplit
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -17,14 +18,34 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-cache"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_HERE, ".hf-cache"))
 
-from dedup import dedup_audio
+from dedup import dedup_audio, new_job_dir, output_extension, WORK_DIR
 
 app = Flask(__name__)
 OUT_DIR = os.path.join(_HERE, "output")
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# 上传缓存等临时文件放在项目所在的磁盘上，不占系统盘；子进程也继承这个设置
+TMP_DIR = os.path.join(WORK_DIR, "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
+os.environ["TEMP"] = os.environ["TMP"] = TMP_DIR
+tempfile.tempdir = TMP_DIR
+
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+
+_AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".mp4", ".aac")
+
+
+def _clean_stale_work() -> None:
+    """启动时清掉上次被强行关闭留下的中间文件。只动 .work，不碰 output 和用户文件。"""
+    for path in glob.glob(os.path.join(WORK_DIR, "job_*")):
+        shutil.rmtree(path, ignore_errors=True)
+    for name in os.listdir(TMP_DIR):
+        path = os.path.join(TMP_DIR, name)
+        try:
+            shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+        except OSError:
+            pass
 
 
 def _safe_name(name: str) -> str:
@@ -32,22 +53,27 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w.\-]", "_", name)
 
 
-def _out_path(input_filename: str, user_outname: str, out_format: str) -> str:
-    if user_outname and user_outname.strip():
-        base = _safe_name(user_outname)
-    else:
-        stem = os.path.splitext(os.path.basename(input_filename))[0]
-        base = f"{stem}_deduped"
-    if not base.lower().endswith((".wav", ".mp3")):
-        base += "." + out_format
-    path = os.path.join(OUT_DIR, base)
-    if os.path.exists(path):
-        stem, ext = os.path.splitext(base)
-        i = 1
-        while os.path.exists(os.path.join(OUT_DIR, f"{stem}_{i}{ext}")):
-            i += 1
-        path = os.path.join(OUT_DIR, f"{stem}_{i}{ext}")
-    return path
+def _out_path(input_filename: str, user_outname: str, ext: str) -> str:
+    """output 里的目标路径：扩展名用真实格式，音频和同名 AAF 都不覆盖已有文件。"""
+    stem = _safe_name(user_outname) if user_outname and user_outname.strip() else ""
+    if stem.lower().endswith(_AUDIO_EXTS):
+        stem = os.path.splitext(stem)[0]
+    if not stem:
+        stem = _safe_name(os.path.splitext(os.path.basename(input_filename))[0]) + "_deduped"
+    candidate, i = stem, 0
+    while (os.path.exists(os.path.join(OUT_DIR, candidate + ext))
+           or os.path.exists(os.path.join(OUT_DIR, candidate + ".aaf"))):
+        i += 1
+        candidate = f"{stem}_{i}"
+    return os.path.join(OUT_DIR, candidate + ext)
+
+
+def _is_local_request() -> bool:
+    """只接受本机页面发起的请求：本地路径模式能读取任意本机文件，不能让其他网页触发。"""
+    if (request.host.rsplit(":", 1)[0]) not in ("127.0.0.1", "localhost"):
+        return False
+    origin = request.headers.get("Origin")
+    return not origin or urlsplit(origin).netloc == request.host
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -72,7 +98,8 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <div id="formwrap">
 <form id="f">
- <label>Audio / video file</label><input type="file" name="audio" accept="audio/*,video/*" required>
+ <label>Local file path (recommended for large files: read in place, no upload or copy)</label><input name="local_path" placeholder="F:\\videos\\talk.mp4">
+ <label>Or upload a file</label><input type="file" name="audio" accept="audio/*,video/*">
  <label>OpenAI-compatible API URL</label><input name="api_url" placeholder="https://api.openai.com/v1">
  <label>Model name</label><input name="model" placeholder="gpt-4o-mini">
  <label>API key</label><input name="api_key" type="password">
@@ -115,9 +142,11 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
   const btn = document.getElementById('btn'); btn.disabled = true;
   document.getElementById('formwrap').style.display='none';
   const proc = document.getElementById('proc'); proc.style.display='block';
-  document.getElementById('status').innerText='Uploading…';
   const fd = new FormData();
   for (const [k,v] of new FormData(document.getElementById('f'))) fd.append(k,v);
+  const usePath = fd.get('local_path').trim() !== '';
+  if (usePath) fd.delete('audio');
+  document.getElementById('status').innerText = usePath ? 'Starting…' : 'Uploading…';
   try {
     const r = await fetch('/dedup', {method:'POST', body: fd});
     const d = await r.json();
@@ -153,9 +182,18 @@ def index():
 
 @app.route("/dedup", methods=["POST"])
 def dedup():
+    if not _is_local_request():
+        return {"error": "Only requests from this machine's own page are accepted."}, 403
+    # “复制文件地址”得到的路径带引号，这里去掉
+    local_path = request.form.get("local_path", "").strip().strip('"\'').strip()
     f = request.files.get("audio")
-    if not f:
-        return {"error": "No audio uploaded."}, 400
+    if local_path:
+        if not os.path.isabs(local_path):
+            return {"error": "Please enter the full path, e.g. F:\\videos\\talk.mp4"}, 400
+        if not os.path.isfile(local_path):
+            return {"error": "File not found. Please check the path."}, 400
+    elif not (f and f.filename):
+        return {"error": "Please enter a local file path or choose a file to upload."}, 400
     api_url = request.form.get("api_url", "").strip()
     model = request.form.get("model", "").strip()
     api_key = request.form.get("api_key", "").strip()
@@ -177,10 +215,18 @@ def dedup():
     if use_llm and not (api_url and model and api_key):
         return {"error": "Please fill in the API URL, model name, and API key."}, 400
 
-    ext = os.path.splitext(f.filename)[1] or ".wav"
-    tmp = os.path.join(OUT_DIR, "_input_" + uuid.uuid4().hex + ext)
-    f.save(tmp)
-    out_path = _out_path(f.filename, outname, out_format)
+    # 所有中间文件都在 job_dir，结束时整个删除；本地路径模式的原文件不在其中，不会被动到
+    job_dir = new_job_dir()
+    try:
+        if local_path:
+            audio_path = local_path
+        else:
+            audio_path = os.path.join(job_dir, _safe_name(f.filename).lstrip(".") or "upload.bin")
+            f.save(audio_path)
+        out_path = _out_path(audio_path, outname, output_extension(audio_path, out_format))
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
     out_url = os.path.basename(out_path)
 
     job_id = uuid.uuid4().hex
@@ -195,10 +241,10 @@ def dedup():
 
     def worker():
         try:
-            info = dedup_audio(tmp, out_path, api_url=api_url, model=model, api_key=api_key,
+            info = dedup_audio(audio_path, out_path, api_url=api_url, model=model, api_key=api_key,
                                whisper_model=whisper, language=language, keep_gap=keep_gap,
                                use_llm=use_llm, api_mode=api_mode, out_format=out_format, out_bitrate=out_bitrate,
-                               seg_gap=seg_gap, pause_dur=pause_dur, progress=_progress)
+                               seg_gap=seg_gap, pause_dur=pause_dur, progress=_progress, work_dir=job_dir)
             with _jobs_lock:
                 j = _jobs[job_id]
                 j["done"] = True
@@ -215,10 +261,7 @@ def dedup():
                 _jobs[job_id]["error"] = str(e)
                 _jobs[job_id]["msg"] = "Error"
         finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            shutil.rmtree(job_dir, ignore_errors=True)
 
     threading.Thread(target=worker, daemon=True).start()
     return {"job_id": job_id}
@@ -253,4 +296,5 @@ def out_file(name):
 
 
 if __name__ == "__main__":
+    _clean_stale_work()
     app.run(host="127.0.0.1", port=7861, debug=False, threaded=True)

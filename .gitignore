@@ -16,8 +16,11 @@ venv/
 .hf-cache/
 .uv-cache/
 
-# Generated output (deduped audio, AAF, debug logs, temp files)
+# Generated results (deduped audio, AAF)
 output/
+
+# Intermediate files, temp files and debug log
+.work/
 
 # Third-party source checkouts / nested git repos (not this project's code)
 CrisperWhisper/
