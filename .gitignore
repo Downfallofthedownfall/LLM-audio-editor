@@ -16,7 +16,7 @@ venv/
 .hf-cache/
 .uv-cache/
 
-# Generated results (deduped audio, AAF)
+# Generated results (deduped audio, Premiere projects)
 output/
 
 # Intermediate files, temp files and debug log

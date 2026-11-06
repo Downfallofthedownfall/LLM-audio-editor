@@ -1,12 +1,13 @@
 """
 音频自动去重引擎：
-  1) faster-whisper 转写英文（带词级/句级时间戳）
-  2) 规则去重：连续重复词、口癖词（精确、无需模型）
-  3) 可选 LLM(OpenAI 兼容，任意 chat.completions / responses 端点) 判定冗余/重复句，返回需删除的段落区间
+  1) CrisperWhisper 逐字转写（在独立解释器中运行，带词级时间戳）
+  2) 规则清理：括号声音标记、无歧义语气词（精确、无需模型）
+  3) LLM（OpenAI 兼容，chat.completions / responses 端点）逐词判定口误，返回要删除的词索引
   4) ffmpeg 流式解码 → 只保留选中区间 → 流式编码，内存占用与时长无关
+  5) 输出视频和音频都剪好的 Premiere 工程（见 premiere.py）
 """
-import os, json, re, tempfile, traceback, glob
-import sys, threading, datetime
+import bisect, collections, datetime, json, os, re, shutil, subprocess, sys, tempfile, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # Windows 中文环境 stdout 默认 GBK，遇到非 GBK 字符会抛 UnicodeEncodeError；强制 UTF-8 输出
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -15,41 +16,22 @@ except Exception:
     pass
 from typing import List, Dict, Optional, Tuple, Set
 
+import premiere
+
 # 让模型/依赖的缓存落在工作区内（Windows 沙箱限制 C:\Users 下缓存写入）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-cache"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_HERE, ".hf-cache"))
 
 
-def _setup_cuda_dll_path():
-    """把 venv 内 nvidia cu12 库的 bin 目录加入 DLL 搜索路径，供 ctranslate2 加载 cublas/cudnn。"""
-    if os.name != "nt":
-        return
-    sp = os.path.join(_HERE, ".venv", "Lib", "site-packages", "nvidia")
-    for d in glob.glob(os.path.join(sp, "*", "bin")):
-        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-        try:
-            os.add_dll_directory(d)
-        except Exception:
-            pass
-
-
-_setup_cuda_dll_path()
-
-# 口癖/填充词（英文）
-FILLERS = {
-    "um", "uh", "erm", "er", "em", "mm", "hmm", "ah", "oh", "uhh", "like",
-    "you know", "i mean", "kind of", "sort of", "actually", "basically", "literally",
-}
-# 常见重复词（用于连续重复检测的豁免，避免误删真正的强调重复）
-AHM = set()
 # 必然删除的无意义语气词（无歧义，直接删；其余交给 LLM 判断）
 CORE_FILLERS = {"um", "uh", "erm", "er", "em", "mm", "hmm", "ah", "oh", "uhh", "eh"}
-# 中文口癖/感叹语气词（无歧义、几乎总是可删；有语义的连接词如“那个/就是/然后”交给 LLM 判断）
+# 中文口癖/感叹语气词。转写可能按单字切分，所以这里只放几乎不会构成其他词的字；
+# 哈（哈佛）、喂（喂养）、吓（吓人）、呵（呵护）、呐（呐喊）这类有歧义的字，
+# 以及“那个/就是/然后”这类有语义的连接词，都交给 LLM 按上下文判断
 CORE_FILLERS_ZH = {
     "嗯", "唔", "呃", "啊", "哦", "噢", "咦", "诶", "欸", "哎", "唉", "喔",
-    "呵", "嘿", "哈", "呐", "咯", "呜", "喂", "呸", "吓", "哎呀", "哎哟",
-    "嗯嗯", "啊啊", "哦哦", "嘻嘻",
+    "哎呀", "哎哟", "嗯嗯", "啊啊", "哦哦", "嘻嘻",
 }
 # 中文语言码识别
 _ZH_LANGS = {"zh", "zh-cn", "zh-tw", "yue", "chi", "chinese"}
@@ -68,8 +50,8 @@ def _norm_language(language: str) -> str:
 
 
 def _is_bracket_sound(w: str) -> bool:
-    """形如 [throatclearing]、[UM]、[cough] 之类的声音标记。"""
-    return bool(re.match(r"^\s*\[[^\]]+\]", w))
+    """形如 [throatclearing]、[UM]、[cough]、【咳嗽】 之类的声音标记。"""
+    return bool(re.match(r"^\s*(\[[^\]]+\]|【[^】]+】)", w))
 
 
 def _report(progress, frac: float, msg: str):
@@ -110,32 +92,28 @@ def _dbg(msg):
         pass
 
 
-def transcribe(audio_path: str, model_size: str = "large", device: Optional[str] = None,
-               language: str = "en", progress=None, *, work_dir: str) -> List[Dict]:
+def transcribe(audio_path: str, model_size: str = "large", language: str = "en", progress=None,
+               *, work_dir: str) -> List[Dict]:
     """用 CrisperWhisper verbatim 转写（全局 Python 3.14 + torch），返回词级 token 列表。
 
     子进程分块转写并实时把 STAGE/PROGRESS 打到 stdout，本函数用 Popen + 读线程
     解析并转给 UI，避免长音频看起来像卡住。
     """
-    import subprocess, json as _json, threading
-    here = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(here, "faithful_transcribe.py")
+    script = os.path.join(_HERE, "faithful_transcribe.py")
     tmp = os.path.join(work_dir, "words.json")
     _report(progress, 0.08, f"Loading CrisperWhisper ({model_size}, verbatim)…")
     _dbg("faithful transcribe (streaming) via global py-3.14, model=%s" % model_size)
-    # 清掉 PATH 里的 nvidia cu12 目录（避免全局 torch cu132 误用 venv 的 cuDNN 12）
-    clean = os.environ.copy()
-    pp = [p for p in clean.get("PATH", "").split(os.pathsep)
-          if not any(k in p.lower() for k in ("nvidia", "cublas", "cudnn", "cuda_runtime", "cuda_nvrtc"))]
-    clean["PATH"] = os.pathsep.join(pp)
 
     proc = subprocess.Popen(
         ["py", "-3.14", script, audio_path, tmp, model_size, "30", "27", str(language)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", env=clean, bufsize=1,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        env=dict(os.environ, PYTHONIOENCODING="utf-8"),
     )
-    # 进度锚点（占总进度 0.08→0.82）
-    f0, f1, span = 0.08, 0.15, 0.60
+    # 进度锚点（占总进度 0.08→0.70，后面留给 LLM 和拼接）
+    f0, f1, span = 0.08, 0.15, 0.55
+    errors: List[str] = []
+    tail = collections.deque(maxlen=5)  # 进程意外崩溃时（没有 ERR 行）用来说明原因
 
     def _reader():
         for line in proc.stdout:
@@ -143,6 +121,7 @@ def transcribe(audio_path: str, model_size: str = "large", device: Optional[str]
             if not line:
                 continue
             _dbg("[transcribe] " + line)
+            tail.append(line)
             if line.startswith("STAGE LOADING_AUDIO"):
                 _report(progress, f0 + 0.03, "Extracting audio (large videos take a few minutes)…")
             elif line.startswith("STAGE LOADING"):
@@ -157,34 +136,28 @@ def transcribe(audio_path: str, model_size: str = "large", device: Optional[str]
                     try:
                         n, ntot = int(parts[1]), int(parts[2])
                         frac = f1 + span * (n / max(1, ntot))
-                        _report(progress, min(0.80, frac), f"Transcribing chunks… {n}/{ntot}")
+                        _report(progress, min(0.70, frac), f"Transcribing chunks… {n}/{ntot}")
                     except ValueError:
                         pass
-            elif line.startswith("WARN"):
-                _dbg("[transcribe-warn] " + line)
-            elif line.startswith("ERR"):
-                _report(progress, 0.0, "Transcription failed")
+            elif line.startswith("ERR "):
+                errors.append(line[4:])
 
     th = threading.Thread(target=_reader, daemon=True)
     th.start()
     rc = proc.wait()
     th.join(timeout=2.0)
     if rc != 0:
-        raise RuntimeError("CrisperWhisper failed (exit %d)." % rc)
+        detail = errors[-1] if errors else " | ".join(tail)
+        raise RuntimeError("CrisperWhisper failed (exit %d): %s" % (rc, detail[-500:]))
     try:
-        data = _json.load(open(tmp, encoding="utf-8"))
+        with open(tmp, encoding="utf-8") as f:
+            data = json.load(f)
     except Exception as e:
         raise RuntimeError("CrisperWhisper produced no valid words: %r" % (str(e)[:200]))
     if not data:
         raise RuntimeError("CrisperWhisper returned no words.")
-    tokens: List[Dict] = []
-    for i, w in enumerate(data):
-        tokens.append({
-            "index": i, "word": w["word"],
-            "start": float(w["start"]), "end": float(w["end"]),
-            "seg_index": 0, "seg_text": w["word"],
-        })
-    _report(progress, 0.82, f"Verbatim transcription complete: {len(tokens)} words")
+    tokens = [{"word": w["word"], "start": float(w["start"]), "end": float(w["end"])} for w in data]
+    _report(progress, 0.70, f"Verbatim transcription complete: {len(tokens)} words")
     return tokens
 
 
@@ -194,130 +167,6 @@ def _as_posix_clean(word: str) -> str:
     if not word:
         return ""
     return re.sub(r"[^\w']", "", word.lower())
-
-
-def rule_based_removes(tokens: List[Dict]) -> List[Tuple[float, float]]:
-    """连续重复词 + 口癖检测，返回需删除的 (start,end) 秒区间"""
-    removes: List[Tuple[float, float]] = []
-    n = len(tokens)
-    # 连续重复词：例如 "I I I"、"the the"、句首重复
-    i = 0
-    while i < n:
-        w = tokens[i]["word"]
-        clean = _as_posix_clean(w)
-        j = i + 1
-        while j < n and _as_posix_clean(tokens[j]["word"]) == clean:
-            j += 1
-        # 若同一词连续出现 >=2 次，保留第一个，删掉后面重复的
-        if j - i >= 2:
-            # 只保留第一处，删除第 i+1..j-1
-            keep_tokens = [tokens[i]]
-            for k in range(i + 1, j):
-                removes.append((tokens[k]["start"], tokens[k]["end"]))
-            i = j
-        else:
-            i += 1
-    # 口癖词（独立成词的填充词）：删掉该 token
-    for t in tokens:
-        clean = _as_posix_clean(t["word"])
-        if clean in FILLERS and len(clean) <= 5:
-            removes.append((t["start"], t["end"]))
-    return _merge_intervals(removes)
-
-
-def llm_dedup_segments(tokens: List[Dict], api_url: str, model: str, api_key: str,
-                       timeout: int = 300, seg_gap: float = 0.3,
-                       pause_units: Optional[List[Tuple[float, float]]] = None,
-                       api_mode: str = "auto") -> List[Tuple[float, float]]:
-    """调用 OpenAI 兼容接口（chat.completions / responses），按句/段判定需要删除的冗余重复内容，返回区间"""
-    # 分段：优先用停顿单元(音频能量切分，对停顿敏感)，否则回退 whisper 分句
-    if pause_units:
-        segs = []
-        ts = sorted(tokens, key=lambda t: t["start"])
-        unit_words: Dict[int, List[Dict]] = {i: [] for i in range(len(pause_units))}
-        for t in ts:
-            mid = (t["start"] + t["end"]) / 2
-            # 优先落在包含 mid 的单元；若落在停顿间隙，则归到最近的单元，绝不留白/丢词
-            best = None
-            best_d = float("inf")
-            for i, (us, ue) in enumerate(pause_units):
-                if us <= mid <= ue:
-                    best = i
-                    break
-                d = min(abs(mid - us), abs(mid - ue))
-                if d < best_d:
-                    best_d = d
-                    best = i
-            if best is not None:
-                unit_words[best].append(t)
-        for i, (us, ue) in enumerate(pause_units):
-            ws = sorted(unit_words[i], key=lambda w: w["start"])
-            if ws:
-                segs.append({"start": ws[0]["start"], "end": ws[-1]["end"],
-                             "text": " ".join(w["word"] for w in ws)})
-    else:
-        segs = None
-    if segs:
-        seg_list = segs
-    else:
-        segs = {}
-        order = []
-        for t in tokens:
-            si = t["seg_index"]
-            if si not in segs:
-                segs[si] = {"start": t["start"], "end": t["end"], "parts": []}
-                order.append(si)
-            segs[si]["start"] = min(segs[si]["start"], t["start"])
-            segs[si]["end"] = max(segs[si]["end"], t["end"])
-            segs[si]["parts"].append(t["word"])
-        seg_list = [{"start": segs[si]["start"], "end": segs[si]["end"],
-                     "text": " ".join(segs[si]["parts"]).strip()} for si in order]
-    seg_lines = [f"[{i}] {s['start']:.2f}-{s['end']:.2f}s  {s['text']}" for i, s in enumerate(seg_list)]
-    transcript = "\n".join(seg_lines)
-    prompt = (
-        "You are an audio-editing assistant for English speech. Below is a transcript split into "
-        "numbered segments, each with a start/end time. Your job: find segments a human editor would "
-        "DELETE because they are broken or redundant.\n\n"
-        "DELETE these categories:\n"
-        "1) FRAGMENTS / INCOMPLETE RESTARTS: a segment that is NOT a coherent complete sentence — a "
-        "half-finished restart, self-correction, or broken partial phrase (e.g. \"inspired by new york "
-        "city inspired by new york city i\" is a garbled restart). Delete these even if they are not "
-        "exact duplicates and even when the surrounding context differs.\n"
-        "2) DUPLICATE LINES: when the SAME full sentence/line is spoken more than once, keep ONLY the "
-        "LATEST occurrence (the one appearing last in time) and delete ALL the earlier ones.\n"
-        "3) Redundant filler or rambling that adds no new information.\n\n"
-        "Do NOT delete coherent complete sentences that add new information, even if they share common "
-        "phrases or mention the same topic. Be conservative: only delete segments you are confident are "
-        "broken fragments or genuine duplicates.\n\n"
-        "Transcript segments:\n" + transcript +
-        "\n\nReturn JSON: {\"remove_segments\": [indices to DELETE]}. For duplicate lines delete all but "
-        "the last; for broken fragments delete them. If none, return {\"remove_segments\": []}. JSON only."
-    )
-    try:
-        _dbg("==== LLM dedup start ====")
-        _dbg("Segments sent to LLM: %d (showing first 40):\n%s"
-             % (len(segs), "\n".join(seg_lines[:40])))
-        from openai import OpenAI
-        client = OpenAI(base_url=api_url, api_key=api_key, timeout=timeout)
-        content = _completion_text(client, model, [{"role": "user", "content": prompt}],
-                                   api_mode=api_mode, json_mode=True)
-        if not content:
-            _dbg("[warn] LLM dedup empty reply, fallback to rule-based")
-            return []
-        _dbg("LLM raw reply:\n" + content)
-        data = json.loads(_strip_json_fences(content))
-        idxs = data.get("remove_segments", [])
-        _dbg("LLM parsed remove_segments: " + repr(idxs) + " (of %d segs)" % len(seg_list))
-        result = []
-        for si in idxs:
-            if isinstance(si, int) and 0 <= si < len(seg_list):
-                result.append((seg_list[si]["start"], seg_list[si]["end"]))
-        _dbg("LLM dedup -> ranges to delete: " + repr(result))
-        return _merge_intervals(result)
-    except Exception as e:
-        _dbg("[warn] LLM dedup failed, fallback to rule-based: %r" % (str(e)[:300]))
-        _dbg("[debug] segment count: %d" % len(seg_list))
-        return []
 
 
 def _merge_intervals(intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -353,102 +202,10 @@ def speech_blocks(tokens: List[Dict], keep_gap: float = 0.8, pad: float = 0.06) 
     return _merge_intervals(padded)
 
 
-def _subtract(blocks: List[Tuple[float, float]], removes: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    """从保留片段里去掉与 removes 重叠的部分（LLM 判重用）。结果合并去重。"""
-    removes = sorted(removes)
-    keeps: List[Tuple[float, float]] = []
-    for bs, be in blocks:
-        cur = bs
-        for rs, re in removes:
-            # 关键修复：删除区间起点已越过本块终点，则该块剩余部分全部保留，停止处理
-            if rs >= be:
-                break
-            rs, re = max(rs, cur), min(re, be)
-            if re > cur:
-                if rs > cur:
-                    keeps.append((cur, rs))
-                cur = max(cur, re)
-        if cur < be:
-            keeps.append((cur, be))
-    return _merge_intervals(keeps)
-
-
-def pause_segments(audio_path: str, silence_dur: float = 0.25, noise_db: float = -40.0) -> List[Tuple[float, float]]:
-    """用音频能量(ffmpeg silencedetect)按停顿切分，返回说话片段 [(start_s,end_s),...]。"""
-    import subprocess, re, shutil
-    if shutil.which("ffmpeg") is None:
-        return []
-    # 检测静音区间
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-i", audio_path, "-af",
-             f"silencedetect=noise={noise_db}dB:d={silence_dur}", "-f", "null", "-"],
-            capture_output=True, text=True)
-        txt = r.stderr or ""
-    except Exception:
-        return []
-    s_starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", txt)]
-    s_ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", txt)]
-    # 配对成静音区间
-    sil = []
-    for i, st in enumerate(s_starts):
-        en = s_ends[i] if i < len(s_ends) else None
-        sil.append((st, en if en is not None else st + silence_dur))
-    # 说话片段 = 去掉静音后的剩余
-    total = _audio_duration(audio_path)
-    speech = []
-    cur = 0.0
-    for st, en in sil:
-        st = max(0.0, min(st, total))
-        en = max(0.0, min(en, total))
-        if st > cur:
-            speech.append((cur, st))
-        cur = max(cur, en)
-    if cur < total:
-        speech.append((cur, total))
-    return [s for s in speech if s[1] - s[0] > 0.05]
-
-
-def find_repeated_phrases(tokens: List[Dict], min_len: int = 6, max_len: int = 14) -> List[Tuple[float, float]]:
-    """n-gram 检测全文重复的短语：对每个重复短语，保留时间上最新的一次，删掉前面所有。"""
-    n = len(tokens)
-    if n < min_len:
-        return []
-    norm = [re.sub(r"[^a-z0-9']", "", t["word"].lower()) for t in tokens]
-    removes: List[Tuple[float, float]] = []
-    for L in range(min_len, max_len + 1):
-        occ: Dict[tuple, List[int]] = {}
-        for i in range(n - L + 1):
-            key = tuple(norm[i:i + L])
-            if any(not w for w in key):
-                continue
-            occ.setdefault(key, []).append(i)
-        for key, idxs in occ.items():
-            if len(idxs) < 2:
-                continue
-            idxs.sort()
-            clusters = []
-            cur = [idxs[0]]
-            for j in idxs[1:]:
-                if j - cur[-1] <= L:
-                    cur.append(j)
-                else:
-                    clusters.append(cur)
-                    cur = [j]
-            clusters.append(cur)
-            if len(clusters) < 2:
-                continue
-            for cl in clusters[:-1]:
-                removes.append((tokens[cl[0]]["start"], tokens[cl[0] + L - 1]["end"]))
-    return _merge_intervals(removes)
-
-
 def _ffprobe(path: str) -> Dict:
-    """用 ffprobe 读取音频流参数（codec/sample_rate/channels/bit_rate）及文件时长。"""
-    import subprocess, json, shutil
+    """用 ffprobe 读取音频流参数（codec/sample_rate/channels/bit_rate）及文件时长（秒，读不到时为 None）。"""
     if shutil.which("ffprobe") is None:
         return {}
-    out = {}
     try:
         out = json.loads(subprocess.check_output(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -468,7 +225,7 @@ def _ffprobe(path: str) -> Dict:
         fmt = json.loads(subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "json", path]))
-        meta["duration"] = fmt.get("format", {}).get("duration")
+        meta["duration"] = float(fmt["format"]["duration"])
     except Exception:
         meta["duration"] = None
     return meta
@@ -476,13 +233,9 @@ def _ffprobe(path: str) -> Dict:
 
 def _audio_duration(path: str) -> float:
     """优先用 ffprobe 的时长；容器里没有时长时流式解码并计数，不把音频读进内存。"""
-    import subprocess
     d = _ffprobe(path).get("duration")
     if d:
-        try:
-            return float(d)
-        except Exception:
-            pass
+        return d
     proc = subprocess.Popen(
         ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0", "-vn",
          "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "8000", "-ac", "1", "-"],
@@ -540,15 +293,13 @@ def _pcm_bits(meta: Dict) -> int:
 
 
 def _splice_keep(audio_path: str, keep_blocks: List[Tuple[float, float]], out_path: str,
-                 out_format: str = "auto", out_bitrate: str = "256k", *,
+                 out_format: str = "auto", out_bitrate: str = "320k", *,
                  work_dir: str, progress=None) -> None:
     """流式拼接：ffmpeg 解码到管道，只把保留区间写给另一个 ffmpeg 编码。
 
     全程只在内存里保留一个 _PIPE_CHUNK，不会把整条音轨读进内存，长视频也一样；
     保留原始采样率/声道。先写到 work_dir，成功后才移到 out_path。
     """
-    import subprocess, shutil
-
     meta = _ffprobe(audio_path)
     fmt, codec, bitrate, _ = _resolve_output(
         out_format, meta.get("codec_name", ""), meta.get("bit_rate", "") or "", out_bitrate)
@@ -562,7 +313,7 @@ def _splice_keep(audio_path: str, keep_blocks: List[Tuple[float, float]], out_pa
         codec = f"pcm_{pcm}"
     frame_size = ch * bits // 8
 
-    total_dur = float(meta.get("duration") or 0) or float("inf")
+    total_dur = meta.get("duration") or float("inf")
     spans = []
     for s, e in sorted(keep_blocks):
         s_ms = int(max(0.0, min(float(s), total_dur)) * 1000)
@@ -625,7 +376,7 @@ def _splice_keep(audio_path: str, keep_blocks: List[Tuple[float, float]], out_pa
                 pct = int(100 * pos / end_frame)
                 if pct != last_pct:
                     last_pct = pct
-                    _report(progress, 0.93 + 0.06 * pct / 100, f"Splicing… {pct}%")
+                    _report(progress, 0.90 + 0.05 * pct / 100, f"Splicing… {pct}%")
             enc.stdin.close()
             enc_rc = enc.wait()
         except OSError:  # 编码器提前退出（Windows 上写断开的管道可能报 EINVAL 而不是 EPIPE）
@@ -638,6 +389,10 @@ def _splice_keep(audio_path: str, keep_blocks: List[Tuple[float, float]], out_pa
             if enc.poll() is None:
                 enc.kill()
                 enc.wait()
+            try:
+                enc.stdin.close()
+            except OSError:  # 编码器已退出，缓冲区里剩下的数据写不出去
+                pass
     if enc_rc != 0:
         raise RuntimeError("ffmpeg encode failed: " + _log_tail(enc_log_path))
     if not written:
@@ -672,8 +427,8 @@ DEDUP_RULES = (
     "  * A complete, grammatical sentence that carries NEW information — even when it reuses common words or re-mentions "
     "the same topic as a deleted fragment.\n\n"
     "Be CONSERVATIVE: only delete words you are confident are mis-speaks. When in doubt, KEEP. "
-    "Return ONLY a JSON array of the GLOBAL_INDEX numbers to DELETE, e.g. [0,1,2,5,10,11,12,15]. "
-    "If nothing to delete, return []. JSON only — no explanation."
+    "Return ONLY a JSON object listing the GLOBAL_INDEX numbers to DELETE, e.g. {\"indices\":[0,1,2,5,10,11,12,15]}. "
+    "If nothing to delete, return {\"indices\":[]}. JSON only — no explanation."
 )
 
 
@@ -681,7 +436,7 @@ DEDUP_RULES = (
 DEDUP_SYSTEM = (
     "You are a precise audio-editing assistant. You receive a transcript of spoken words, each on its own line as "
     "'GLOBAL_INDEX  WORD'. Your ONLY job is to decide which words are MIS-SPEAKS and must be DELETED, then return them "
-    "as a compact JSON array of indices. Work directly and tersely: do NOT reason step-by-step, do NOT explain, do NOT "
+    "as a compact JSON object {\"indices\":[...]}. Work directly and tersely: do NOT reason step-by-step, do NOT explain, do NOT "
     "quote or repeat the transcript, and do NOT output anything except the final JSON. Reply immediately with the JSON "
     "only — no thinking block, no commentary."
 )
@@ -703,17 +458,28 @@ DEDUP_RULES_ZH = (
     "绝不删除：\n"
     "  * 完整、有语法、携带新信息的句子——即使它复用了常见词，或与某个已删片段提到同一话题。\n\n"
     "要保守：只删你确信是口误的词；拿不准就保留。"
-    "只返回一个 JSON 数组，列出要删除的 GLOBAL_INDEX 编号，例如 [0,1,2,5,10,11,12,15]。"
-    "没有要删的就返回 []。只输出 JSON，不要解释。"
+    "只返回一个 JSON 对象，列出要删除的 GLOBAL_INDEX 编号，例如 {\"indices\":[0,1,2,5,10,11,12,15]}。"
+    "没有要删的就返回 {\"indices\":[]}。只输出 JSON，不要解释。"
 )
 
 # 系统提示：让模型直接、简洁地返回 JSON（中文）
 DEDUP_SYSTEM_ZH = (
     "你是一名精确的音频编辑助手。你会收到一段口播逐词转写，每个词/字单独一行，格式为『GLOBAL_INDEX  词』。"
-    "你唯一的任务是判断哪些词是『口误』必须删除，然后用一个紧凑的 JSON 数组返回它们的编号。"
+    "你唯一的任务是判断哪些词是『口误』必须删除，然后用一个紧凑的 JSON 对象 {\"indices\":[...]} 返回它们的编号。"
     "直接、简洁地工作：不要一步步推理，不要解释，不要引用或复述转写，除了最后的 JSON 什么都不要输出。"
     "立刻用 JSON 回复——不要思考块，不要任何评论。"
 )
+
+
+# 每个窗口的三段标记：前后上下文只帮助理解语境，只有中间一段的判定会被采用
+_WINDOW_NOTES = {
+    "en": ("=== CONTEXT BEFORE (read only: judged in another window, may start mid-sentence; do not return these indices) ===",
+           "=== WORDS TO JUDGE (return indices from this section only) ===",
+           "=== CONTEXT AFTER (read only: shows whether a phrase above is said again, may end mid-sentence; do not return these indices) ==="),
+    "zh": ("=== 前文上下文（只读：已在其他窗口判定，开头可能是半句；不要返回这里的编号）===",
+           "=== 待判定内容（只返回这一段里的编号）===",
+           "=== 后文上下文（只读：用来判断上面的短语后面是否被重说，结尾可能是半句；不要返回这里的编号）==="),
+}
 
 
 def _dedup_prompts(language: str):
@@ -772,289 +538,173 @@ def _resp_text(resp) -> str:
 def _strip_json_fences(content: str) -> str:
     """去掉模型包裹 JSON 的 ``` 代码围栏 / 前后说明文字，便于 json.loads。"""
     s = (content or "").strip()
-    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*```$", "", s)
-    return s.strip()
+    starts = [i for i in (s.find("{"), s.find("[")) if i >= 0]
+    end = max(s.rfind("}"), s.rfind("]"))
+    if starts and end > min(starts):
+        s = s[min(starts):end + 1]
+    return s
 
 
-# 控制 Responses API 的思考强度：none=关闭思考；minimal/low=低强度；medium/high=高强度
-# 关思考(none)会导致模型逐个词乱删（碎片化、choppy），故用 low（低强度，仍快且删得连贯）
-REASONING_EFFORT = "low"
+def _parse_indices(content: str) -> List[int]:
+    """从模型回复里解析词索引。回复不是预期结构时抛 ValueError，与「没有要删的」区分开。"""
+    parsed = json.loads(_strip_json_fences(content))
+    if isinstance(parsed, dict):
+        lists = [v for v in parsed.values() if isinstance(v, list)]
+        parsed = parsed["indices"] if "indices" in parsed else (lists[0] if len(lists) == 1 else None)
+    if not isinstance(parsed, list):
+        raise ValueError("unexpected reply shape: %r" % content[:100])
+    indices = []
+    for x in parsed:
+        if isinstance(x, bool):
+            continue
+        if isinstance(x, float) and x.is_integer():
+            x = int(x)
+        elif isinstance(x, str) and x.strip().isdigit():
+            x = int(x)
+        if isinstance(x, int):
+            indices.append(x)
+    return indices
 
 
-def _completion_text(client, model: str, messages: List[Dict], api_mode: str = "auto",
-                     json_mode: bool = False) -> str:
-    """向任意 OpenAI 兼容端点发送消息并返回助手文本。
+# 思考强度。DeepSeek V4 系列可选 none（关闭）/ low / high / max，不传时默认开启且为 high。
+# 关思考(none)会导致模型逐个词乱删（碎片化、choppy）。判定口误要对照上下文，质量优先，故用 high
+REASONING_EFFORT = "high"
+
+# 这些 HTTP 状态表示换一组参数可能成功（提供方不接受某个参数）
+_HTTP_BAD_PARAMS = {400, 415, 422}
+# 这些 HTTP 状态表示该端点不存在，换另一种 API
+_HTTP_NO_ENDPOINT = {404, 405, 501}
+
+
+def _llm_option_ladder(mode: str) -> List[Dict]:
+    """某种 API 可选参数的组合，由全到简。JSON 模式优先，都不行时靠回复文本解析 JSON。"""
+    if mode == "chat":
+        fmt = {"response_format": {"type": "json_object"}}
+        tunings = [{"temperature": 0.0, "reasoning_effort": REASONING_EFFORT},
+                   {"reasoning_effort": REASONING_EFFORT}, {"temperature": 0.0}, {}]
+    else:
+        fmt = {"text": {"format": {"type": "json_object"}}}
+        tunings = [{"reasoning": {"effort": REASONING_EFFORT}}, {}]
+    return [{**t, **fmt} for t in tunings] + tunings
+
+
+class _LLMClient:
+    """OpenAI 兼容端点的客户端，记住第一组可用的 API 和参数，后续窗口不再重复试错。
 
     api_mode：
       "chat"       -> 只用 chat.completions
       "responses"  -> 只用 Responses API
-      "auto"       -> 先试 Responses API，失败再回退 chat.completions
-    json_mode=True 时会请求结构化 JSON 输出；若提供方拒绝该参数则自动回退到纯文本，
-    调用方再负责从文本中解析 JSON。
+      "auto"       -> 先试 Responses API，端点不存在或拒绝请求时回退 chat.completions
 
-    对 Responses API 额外发送 reasoning.effort（默认 none = 关闭思考模式），避免
-    deepseek-v4 系列默认开启高强度思考导致回答被路由到 reasoning_content（content 为空）
-    或又慢又费 token。
+    提供方拒绝某个参数（如模型不支持 temperature 或 reasoning）时逐级去掉参数重试。
+    鉴权失败、限流、超时、断网时重试参数没有意义，直接抛出。
     """
-    modes = {"chat": ["chat"], "responses": ["responses"],
-             "auto": ["responses", "chat"]}.get(api_mode, ["responses", "chat"])
-    json_flags = [True, False] if json_mode else [False]
-    for mode in modes:
-        for want_json in json_flags:
+
+    def __init__(self, api_url: str, model: str, api_key: str, api_mode: str = "auto", timeout: int = 600):
+        from openai import OpenAI
+        self._client = OpenAI(base_url=api_url, api_key=api_key, timeout=timeout, max_retries=1)
+        self._model = model
+        self._modes = {"chat": ["chat"], "responses": ["responses"]}.get(api_mode, ["responses", "chat"])
+        self._working = None  # 第一组成功的 (mode, options)
+
+    def _send(self, mode: str, options: Dict, messages: List[Dict], timeout) -> str:
+        extra = {"timeout": timeout} if timeout else {}
+        if mode == "chat":
+            resp = self._client.chat.completions.create(model=self._model, messages=messages, **options, **extra)
+            return (getattr(resp.choices[0].message, "content", "") or "").strip()
+        resp = self._client.responses.create(model=self._model, input=messages, **options, **extra)
+        return _resp_text(resp).strip()
+
+    def complete(self, messages: List[Dict], timeout=None) -> str:
+        """返回助手回复的文本；所有组合都失败时抛 RuntimeError，说明最后一个错误。"""
+        attempts = [(mode, opts) for mode in self._modes for opts in _llm_option_ladder(mode)]
+        if self._working:
+            attempts.insert(0, self._working)
+        last_error = "empty reply"
+        no_endpoint = set()
+        for mode, options in attempts:
+            if mode in no_endpoint:
+                continue
             try:
-                if mode == "chat":
-                    kwargs = dict(model=model, messages=messages, temperature=0.0)
-                    if want_json:
-                        kwargs["response_format"] = {"type": "json_object"}
-                    resp = client.chat.completions.create(**kwargs)
-                    txt = (getattr(resp.choices[0].message, "content", "") or "").strip()
-                else:
-                    kwargs = dict(model=model, input=messages)
-                    kwargs["reasoning"] = {"effort": REASONING_EFFORT}
-                    if want_json:
-                        kwargs["text"] = {"format": {"type": "json_object"}}
-                    resp = client.responses.create(**kwargs)
-                    txt = _resp_text(resp).strip()
-                if txt:
-                    return txt
+                txt = self._send(mode, options, messages, timeout)
             except Exception as e:
-                _dbg("[warn] llm %s json=%s failed: %r" % (mode, want_json, str(e)[:200]))
-    return ""
+                status = getattr(e, "status_code", None)
+                last_error = str(e)[:300]
+                _dbg("[warn] llm %s %s failed: %s" % (mode, sorted(options), last_error))
+                if status in _HTTP_NO_ENDPOINT:
+                    no_endpoint.add(mode)
+                elif status not in _HTTP_BAD_PARAMS:
+                    raise RuntimeError(last_error)
+                continue
+            if txt:
+                self._working = (mode, options)
+                return txt
+            last_error = "empty reply"  # JSON 模式下回复可能只剩空格，去掉参数再试
+        raise RuntimeError(last_error)
+
+    def check(self) -> None:
+        """发一个极小的请求确认 URL、密钥和模型名可用。"""
+        self.complete([{"role": "user", "content": 'Reply with the JSON object {"ok": true}.'}], timeout=120)
 
 
-def llm_dedup_words(words: List[Dict], api_url: str, model: str, api_key: str,
-                    timeout: int = 600, progress=None, api_mode: str = "auto",
-                    language: str = "en") -> List[int]:
-    """调用 OpenAI 兼容接口（chat.completions / responses）分窗判重。
+_LLM_WINDOW_WORDS, _LLM_CONTEXT_WORDS, _LLM_WORKERS = 500, 70, 10
 
-    每窗约 WIN 词 + LOOK 回看上下文，多窗并行。可在 api_mode 中指定使用的端点类型
-    （auto 会自动在 chat.completions 与 responses 之间回退），并根据 language 选择
-    英文/中文判重 prompt。返回要删除的全局词索引数组。"""
+
+def llm_dedup_words(words: List[Dict], llm: _LLMClient, progress=None,
+                    language: str = "en") -> Tuple[List[int], List[str], int]:
+    """用 LLM 分窗判定口误，返回 (要删除的全局词索引, 失败窗口的说明, 窗口总数)。
+
+    每窗判定 _LLM_WINDOW_WORDS 个词，前后各带 _LLM_CONTEXT_WORDS 个词的只读上下文。
+    规则是「保留最后一次、删除更早的」，所以必须看到后文，才能判定窗口末尾的词后面是否被重说；
+    只采用待判定段内的索引，上下文两端的半句话就不会被误判成残句。多窗并行。
+    """
     n = len(words)
     if n == 0:
-        return []
+        return [], [], 0
     rules, system_prompt = _dedup_prompts(language)
-    ctx_note = ("... (上面是上一窗口的上下文，仅供参考；也可判为口误删除) ..."
-                if language in _ZH_LANGS else
-                "... (above is the previous window's context, for reference only; may also be judged a mistake) ...")
-    WIN, LOOK = 500, 70
-    windows = []
-    a = 0
-    while a < n:
-        b = min(n, a + WIN)
-        ctx = max(0, a - LOOK) if a > 0 else 0
-        windows.append((ctx, b, a))
-        if b >= n:
-            break
-        a = b
+    before_note, judge_note, after_note = _WINDOW_NOTES[_norm_language(language)]
+    windows = [(max(0, a - _LLM_CONTEXT_WORDS), a, min(n, a + _LLM_WINDOW_WORDS),
+                min(n, a + _LLM_WINDOW_WORDS + _LLM_CONTEXT_WORDS))
+               for a in range(0, n, _LLM_WINDOW_WORDS)]
     total = len(windows)
-    try:
-        from openai import OpenAI
-        client = OpenAI(base_url=api_url, api_key=api_key, timeout=timeout)
-    except Exception as e:
-        _dbg("[warn] OpenAI client init failed: %r" % (str(e)[:200]))
-        return []
 
-    def _window(w):
-        ctx, b, acpt = w
-        lines = _win_lines(words, ctx, b)
-        if ctx < acpt:
-            lines = [ctx_note] + lines
-        readable = "\n".join(lines)
-        _dbg("==== window (accepted %d-%d) ====\n%s" % (acpt, b, "\n".join(lines[:25])))
+    def _judge(win) -> Set[int]:
+        ctx_start, acpt, acpt_end, ctx_end = win
+        lines = [judge_note] + _win_lines(words, acpt, acpt_end)
+        if ctx_start < acpt:
+            lines = [before_note] + _win_lines(words, ctx_start, acpt) + lines
+        if acpt_end < ctx_end:
+            lines += [after_note] + _win_lines(words, acpt_end, ctx_end)
+        _dbg("==== window (accepted %d-%d) ====\n%s" % (acpt, acpt_end, "\n".join(lines[:25])))
         user_prompt = (rules + "\n\n---\n\nTRANSCRIPT (each word on its own line; the LEFT number is that "
-                       "word's GLOBAL index):\n" + readable +
+                       "word's GLOBAL index):\n" + "\n".join(lines) +
                        "\n\nReturn ONLY a JSON object {\"indices\":[...]} listing the GLOBAL index numbers to DELETE.")
-        messages = [{"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}]
-        content = _completion_text(client, model, messages, api_mode=api_mode, json_mode=True)
-        if not content:
-            _dbg("[warn] window %d-%d returned nothing" % (acpt, b))
-            return set()
-        _dbg("window %d-%d output len=%d tokens~%d"
-             % (acpt, b, len(content), len(content.split())))
+        content = llm.complete([{"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}])
+        _dbg("window %d-%d output len=%d" % (acpt, acpt_end, len(content)))
+        got = {i for i in _parse_indices(content) if acpt <= i < acpt_end}
+        _dbg("window %d-%d -> added %d" % (acpt, acpt_end, len(got)))
+        return got
+
+    def _run(win):
         try:
-            parsed = json.loads(_strip_json_fences(content))
+            return _judge(win), None
         except Exception as e:
-            _dbg("[warn] window %d-%d could not parse JSON: %r" % (acpt, b, str(e)[:150]))
-            return set()
-        idxs = parsed.get("indices", parsed) if isinstance(parsed, dict) else parsed
-        if not isinstance(idxs, list):
-            idxs = []
-        got = sorted({int(x) for x in idxs
-                      if isinstance(x, (int, float)) and acpt <= int(x) < b})
-        _dbg("window %d-%d -> added %d" % (acpt, b, len(got)))
-        return set(got)
+            _dbg("[warn] window %d-%d failed: %r" % (win[1], win[2], str(e)[:300]))
+            return set(), "words %d-%d: %s" % (win[1], win[2], str(e)[:200])
 
-    deleted: set = set()
-    if total == 1:
-        deleted = _window(windows[0])
-    else:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=min(2, total)) as ex:
-            futs = [ex.submit(_window, w) for w in windows]
-            done = 0
-            for fut in as_completed(futs):
-                try:
-                    deleted |= fut.result()
-                except Exception as e:
-                    _dbg("[warn] window task raised: %r" % (str(e)[:150]))
-                done += 1
-                if progress:
-                    try:
-                        progress(0.72 + 0.12 * done / total, "LLM dedup %d/%d windows…" % (done, total))
-                    except Exception:
-                        pass
-    _dbg("LLM dedup total deleted = %d" % len(deleted))
-    return sorted(deleted)
-
-
-def detect_silence_segments(words: List[Dict], threshold: float = 0.5) -> List[Tuple[float, float]]:
-    """检测词间静音（gap >= threshold 秒），返回要删的静音区间 [(start,end)]。"""
-    segs = []
-    for i in range(1, len(words)):
-        gap = words[i]["start"] - words[i - 1]["end"]
-        if gap >= threshold:
-            segs.append((words[i - 1]["end"], words[i]["start"]))
-    return _merge_intervals(segs)
-
-
-def build_delete_segments(words: List[Dict], indices: List[int], merge_gap: float = 0.05) -> List[Tuple[float, float]]:
-    """把词序号映射为时间区间，并按 merge_gap 合并相邻区间（拷贝 videocut 逻辑）。"""
-    if not indices:
-        return []
-    ranges = [(words[i]["start"], words[i]["end"]) for i in indices if 0 <= i < len(words)]
-    if not ranges:
-        return []
-    ranges.sort(key=lambda r: r[0])
-    merged = [list(ranges[0])]
-    for s, e in ranges[1:]:
-        if s - merged[-1][1] <= merge_gap:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-    return [(s, e) for s, e in merged]
-
-
-def _tc(sec: float, fps: int = 25) -> str:
-    """秒 -> HH:MM:SS:FF 时间码。"""
-    frames = int(round(sec * fps))
-    f = frames % fps
-    total_s = frames // fps
-    s = total_s % 60
-    m = (total_s // 60) % 60
-    h = total_s // 3600
-    return "%02d:%02d:%02d:%02d" % (h, m, s, f)
-
-
-def export_aaf(audio_path: str, keep_blocks: List[Tuple[float, float]], out_aaf: str,
-               sr: int = 48000, edit_rate: int = 25, name: str = "Dedup",
-               total_dur: Optional[float] = None) -> str:
-    """把保留片段导出为 AAF 序列（引用外部源文件，Premiere 可链接一个源并替换素材）。"""
-    import aaf2, urllib.parse
-    blocks = sorted((s, e) for s, e in keep_blocks if e - s > 0.02)
-    if not blocks:
-        raise RuntimeError("No keep blocks for aaf.")
-    if total_dur is None:
-        total_dur = _audio_duration(audio_path)
-    url = "file:///" + urllib.parse.quote(os.path.abspath(audio_path).replace("\\", "/"), safe="/:")
-    src_name = os.path.basename(audio_path)
-    total_samples = int(total_dur * sr)
-    with aaf2.open(out_aaf, "w") as f:
-        file_mob = f.create.SourceMob(src_name)
-        loc = f.create.NetworkLocator()
-        loc['URLString'].value = url
-        wav = f.create.WAVEDescriptor()
-        wav['SampleRate'].value = "%d/1000" % sr
-        wav['Length'].value = total_samples
-        wav['Summary'].value = b'\x00\x00\x00\x00'
-        wav.locator.append(loc)
-        file_mob.descriptor = wav
-        _, slot = file_mob.create_essence(edit_rate=edit_rate, media_kind='sound', offline=True)
-        f.content.mobs.append(file_mob)
-        master = f.create.MasterMob("MASTER")
-        f.content.mobs.append(master)
-        clip = file_mob.create_source_clip(slot_id=slot.slot_id, media_kind='sound')
-        mslot = master.create_timeline_slot(edit_rate=edit_rate)
-        mslot.segment = clip
-        comp = f.create.CompositionMob(name)
-        f.content.mobs.append(comp)
-        seq_slot = comp.create_empty_sequence_slot(edit_rate, media_kind='sound')
-        seq = seq_slot.segment
-        for s, e in blocks:
-            c = master.create_source_clip(slot_id=mslot.slot_id, media_kind='sound')
-            c.start = int(round(s * edit_rate))
-            c.length = int(round((e - s) * edit_rate))
-            seq.components.append(c)
-    _dbg("AAF written: %s (%d clips, ref=%s)" % (out_aaf, len(blocks), url))
-    return out_aaf
-
-
-def export_edl(audio_path: str, keep_blocks: List[Tuple[float, float]], out_edl: str,
-               fps: int = 25, title: str = "Step-Audio EditX Dedup") -> str:
-    """把保留片段导出为 Premiere 可导入的 CMX3600 EDL（剪辑单）。"""
-    blocks = sorted((s, e) for s, e in keep_blocks if e - s > 0.02)
-    if not blocks:
-        raise RuntimeError("No keep blocks for edl.")
-    safe_name = re.sub(r"[^A-Za-z0-9_]", "", os.path.splitext(os.path.basename(audio_path))[0])
-    reel = (safe_name[:8] or "SRC")
-    lines = ["TITLE: " + title, "FCM: NON-DROP FRAME", ""]
-    rec = 0.0
-    for i, (s, e) in enumerate(blocks):
-        si, so = _tc(s, fps), _tc(e, fps)
-        ri, ro = _tc(rec, fps), _tc(rec + (e - s), fps)
-        lines.append("%03d  %-8s V  C  %s %s %s %s" % (i + 1, reel, si, so, ri, ro))
-        rec += (e - s)
-    lines.append("")
-    with open(out_edl, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    _dbg("EDL written: %s (%d clips, fps=%d)" % (out_edl, len(blocks), fps))
-    return out_edl
-
-
-def export_fcpxml(audio_path: str, keep_blocks: List[Tuple[float, float]], out_fcpxml: str,
-                  total_dur: Optional[float] = None, name: str = "Step-Audio EditX Dedup") -> str:
-    """把保留片段导出为 Premiere 可导入的 FCPXML 序列（时间线上每个保留段是一个 clip）。"""
-    import urllib.parse
-    if total_dur is None:
-        total_dur = _audio_duration(audio_path)
-    blocks = sorted((s, e) for s, e in keep_blocks if e - s > 0.02)
-    if not blocks:
-        raise RuntimeError("No keep blocks for fcpxml.")
-    abs_path = os.path.abspath(audio_path).replace("\\", "/")
-    uri = "file:///" + urllib.parse.quote(abs_path)
-    base = os.path.basename(abs_path)
-    clips = []
-    for i, (s, e) in enumerate(blocks):
-        clips.append(f'      <asset-clip ref="a1" start="{s:.3f}s" duration="{e - s:.3f}s" name="seg{i}"/>')
-    spine = "\n".join(clips)
-    doc = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<fcpxml version="1.9">\n'
-        '  <resources>\n'
-        '    <format id="r1" name="FFVideoFormatRateUndefined" frameDuration="600/18000"/>\n'
-        f'    <asset id="a1" name="{base}" start="0s" duration="{total_dur:.3f}s" hasVideo="1" hasAudio="1">\n'
-        f'      <media-rep kind="original-media" src="{uri}"/>\n'
-        '    </asset>\n'
-        '  </resources>\n'
-        '  <library>\n'
-        f'    <event name="{name}">\n'
-        '      <project name="Dedup Sequence">\n'
-        '        <sequence format="r1">\n'
-        '          <spine>\n'
-        f'{spine}\n'
-        '          </spine>\n'
-        '        </sequence>\n'
-        '      </project>\n'
-        '    </event>\n'
-        '  </library>\n'
-        '</fcpxml>\n'
-    )
-    with open(out_fcpxml, "w", encoding="utf-8") as f:
-        f.write(doc)
-    _dbg("FCPXML sequence written: %s (%d clips)" % (out_fcpxml, len(blocks)))
-    return out_fcpxml
+    deleted: Set[int] = set()
+    failures: List[str] = []
+    with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, total)) as ex:
+        futures = [ex.submit(_run, w) for w in windows]
+        for done, fut in enumerate(as_completed(futures), 1):
+            got, error = fut.result()
+            deleted |= got
+            if error:
+                failures.append(error)
+            _report(progress, 0.72 + 0.18 * done / total, "LLM dedup %d/%d windows…" % (done, total))
+    _dbg("LLM dedup total deleted = %d, failed windows = %d/%d" % (len(deleted), len(failures), total))
+    return sorted(deleted), failures, total
 
 
 def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.4,
@@ -1089,7 +739,6 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
     if cur_s is not None:
         blocks.append((cur_s, cur_e))
     del_spans.sort()
-    import bisect
     padded: List[Tuple[float, float]] = []
     for s, e in blocks:
         if e - s <= 0.02:
@@ -1099,8 +748,10 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
         i1 = bisect.bisect_left(del_spans, (s, float("-inf"))) - 1
         if i1 >= 0:
             ps = max(ps, del_spans[i1][1])
-        # 右侧最近的被删词（start > e）：pad 终点不越过它的开头
-        i2 = bisect.bisect_right(del_spans, (e, float("inf")))
+        # 右侧最近的被删词（紧贴 e 开始，或与保留词尾部重叠）：pad 终点不越过它的开头
+        i2 = bisect.bisect_left(del_spans, (e, float("-inf")))
+        if i2 > 0 and del_spans[i2 - 1][1] > e:
+            i2 -= 1
         if i2 < len(del_spans):
             pe = min(pe, del_spans[i2][0])
         if pe > ps:
@@ -1116,15 +767,30 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
 
 
 def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key: str,
-                whisper_model: str = "base", language: str = "en", keep_gap: float = 0.8,
-                use_llm: bool = False, out_format: str = "auto", out_bitrate: str = "256k",
-                seg_gap: float = 0.3, pause_dur: float = 0.25, progress=None,
-                api_mode: str = "auto", *, work_dir: str) -> Dict:
-    """去重：只保留有文字的段落(词所在区域)，再减去 LLM 判重标记的词；无文字(静音)自然被切掉。"""
+                whisper_model: str = "large", language: str = "en", keep_gap: float = 0.8,
+                out_format: str = "auto", out_bitrate: str = "320k",
+                progress=None, api_mode: str = "auto", *, work_dir: str) -> Dict:
+    """去重：只保留有文字的段落(词所在区域)，再减去语气词和 LLM 判重标记的词；无文字(静音)自然被切掉。
+
+    返回结果里的 warnings 列出没有完全按要求完成的部分（如 LLM 窗口失败），需要展示给用户。
+    """
     language = _norm_language(language)
     total_dur = _audio_duration(audio_path)
+    warnings: List[str] = []
     _dbg("==== process start ====")
     _dbg("source total duration = %.2f s (ffprobe)" % total_dur)
+
+    if not (api_url and model and api_key):
+        raise RuntimeError("LLM dedup needs an API URL, a model name and an API key.")
+    # 转写可能要跑很久：先确认 API 配置可用，配错了立刻报错，不白等
+    _report(progress, 0.02, "Checking the LLM API…")
+    _dbg("LLM endpoint=%s model=%s api_mode=%s effort=%s" % (api_url, model, api_mode, REASONING_EFFORT))
+    llm = _LLMClient(api_url, model, api_key, api_mode)
+    try:
+        llm.check()
+    except Exception as e:
+        raise RuntimeError("LLM API check failed, please check the URL, model name and key: %s" % str(e)[:300])
+
     words = transcribe(audio_path, whisper_model, language=language, progress=progress, work_dir=work_dir)
     if not words:
         raise RuntimeError("Transcription returned no words.")
@@ -1136,36 +802,46 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     _dbg("text blocks (has text) = %d: %s" % (len(text_blocks), [(round(s,2), round(e,2)) for s,e in text_blocks[:30]]))
     _dbg("text total = %.2f s (of %.2f total)" % (sum(e-s for s,e in text_blocks), total_dur))
 
-    del_set: Set[int] = set()
-    if use_llm and api_key and api_url and model:
-        _report(progress, 0.7, "LLM dedup: analyzing words window by window…")
-        llm_indices = llm_dedup_words(words, api_url, model, api_key, progress=progress,
-                                     api_mode=api_mode, language=language)
-        # 保险：无意义声音标记 + 纯语气词必然删（即使 LLM 漏判）
-        core = _core_fillers_for(language)
-        auto = set()
-        for i, w in enumerate(words):
-            if _is_bracket_sound(w["word"]) or _as_posix_clean(w["word"]) in core:
-                auto.add(i)
-        del_idx = sorted(set(llm_indices) | auto)
-        del_set = set(del_idx)
-        _dbg("LLM word indices(%d)+auto(%d) -> delete ranges = %s"
-             % (len(llm_indices), len(auto),
-                [(round(words[i]['start'],2), round(words[i]['end'],2)) for i in del_idx]))
+    # 无意义声音标记 + 纯语气词必然删，兜底 LLM 的漏判
+    core = _core_fillers_for(language)
+    del_set: Set[int] = {i for i, w in enumerate(words)
+                         if _is_bracket_sound(w["word"]) or _as_posix_clean(w["word"]) in core}
+    auto_count = len(del_set)
+    _report(progress, 0.7, "LLM dedup: analyzing words window by window…")
+    llm_indices, failures, total_windows = llm_dedup_words(words, llm, progress=progress, language=language)
+    # 全部失败时成片只切了静音，没有意义，不要当成结果交付
+    if len(failures) == total_windows:
+        raise RuntimeError("LLM dedup failed for all %d windows. First error: %s" % (total_windows, failures[0]))
+    del_set |= set(llm_indices)
+    if failures:
+        warnings.append("LLM dedup failed for %d of %d windows, so mis-speaks there were NOT removed. First error: %s"
+                        % (len(failures), total_windows, failures[0]))
+    _dbg("LLM word indices(%d)+auto(%d) -> delete ranges = %s"
+         % (len(llm_indices), auto_count,
+            [(round(words[i]['start'],2), round(words[i]['end'],2)) for i in sorted(del_set)]))
 
     # 直接从「保留词」构建保留块：被删的词整段消失、不留 pad 残响；keep_gap 用前端设置控制切分强度
     keep = clean_keep_blocks(words, del_set, keep_gap=keep_gap, pad=0.06)
     _dbg("keep blocks after LLM = %d: %s" % (len(keep), [(round(s,2), round(e,2)) for s,e in keep[:40]]))
     if not keep:
         raise RuntimeError("Nothing left after filtering.")
-    _report(progress, 0.93, f"Splicing ({out_format})…")
+    _report(progress, 0.90, f"Splicing ({out_format})…")
     _splice_keep(audio_path, keep, out_wav, out_format=out_format, out_bitrate=out_bitrate,
                  work_dir=work_dir, progress=progress)
-    aaf_path = os.path.splitext(out_wav)[0] + ".aaf"
+    _report(progress, 0.96, "Creating the Premiere project (Premiere opens briefly)…")
+    project_path = None
     try:
-        export_aaf(audio_path, keep, aaf_path)
+        project_path, project_warning = premiere.export_project(
+            audio_path, keep, os.path.splitext(out_wav)[0], work_dir, log=_dbg)
+        if project_warning:
+            warnings.append(project_warning)
+        # 上传的文件在任务结束时删除，工程里的素材要重新链接；本地路径模式不受影响
+        if os.path.abspath(audio_path).startswith(os.path.abspath(work_dir) + os.sep):
+            warnings.append("The uploaded source is removed after processing, so Premiere will ask you to relink it. "
+                            "Use the local file path option to avoid this.")
     except Exception as e:
-        _dbg("[warn] aaf export failed: %r" % (str(e)[:200]))
+        _dbg("[warn] premiere export failed: %r" % (str(e)[:200]))
+        warnings.append("The Premiere project could not be created: %s" % str(e)[:200])
     _report(progress, 1.0, "Done")
     kept_sec = round(sum(e - s for s, e in keep), 2)
     removed_sec = round(total_dur - kept_sec, 2)
@@ -1177,7 +853,8 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
         "removed_sec": max(0.0, removed_sec),
         "total_sec": round(total_dur, 2),
         "out_wav": out_wav,
-        "out_aaf": aaf_path if os.path.exists(aaf_path) else None,
+        "out_project": project_path,
+        "warnings": warnings,
     }
 
 
@@ -1186,18 +863,21 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--api-url", default="")
-    ap.add_argument("--model", default="")
-    ap.add_argument("--api-key", default="")
+    ap.add_argument("--api-url", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--api-key", required=True)
     ap.add_argument("--api-mode", choices=["auto", "chat", "responses"], default="auto")
     ap.add_argument("--language", default="en")
-    ap.add_argument("--whisper", default="base")
+    ap.add_argument("--whisper", default="large")
     a = ap.parse_args()
-    import shutil
+    # 输出容器跟随 --out 的扩展名，否则 AAC 源配 b.wav 会写出内容与扩展名不符的文件
+    out_ext = os.path.splitext(a.out)[1].lower().lstrip(".")
     job_dir = new_job_dir()
     try:
         info = dedup_audio(a.audio, a.out, a.api_url, a.model, a.api_key, a.whisper,
-                           language=a.language, api_mode=a.api_mode, work_dir=job_dir)
+                           language=a.language, api_mode=a.api_mode,
+                           out_format=out_ext if out_ext in ("wav", "flac", "mp3") else "auto",
+                           work_dir=job_dir)
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
     print(json.dumps(info, indent=2))

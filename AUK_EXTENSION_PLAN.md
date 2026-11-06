@@ -13,7 +13,7 @@ The current pipeline removes mis-speaks by **cutting time ranges out of the orig
 recording and splicing the kept parts back together**:
 
 ```
-verbatim ASR → LLM dedup (word indices) → clean_keep_blocks → splice (cut) → WAV + AAF
+verbatim ASR → LLM dedup (word indices) → clean_keep_blocks → splice (cut) → WAV + Premiere project
 ```
 
 This is lossless with respect to the speaker's voice, but it has an inherent weakness:
@@ -28,7 +28,7 @@ the audio seamlessly**. There is no edit point to hide, because the model produc
 new, continuous waveform.
 
 **Goal:** keep the current cut-based mode as the default (lossless, fast, deterministic,
-Premiere-AAF friendly), and add generative editing as an **opt-in mode** that trades a
+Premiere-project friendly), and add generative editing as an **opt-in mode** that trades a
 little voice fidelity for a **seamless** result.
 
 ---
@@ -68,7 +68,7 @@ Add a **`dedup_method`** selector to the web UI and to `dedup_audio(...)`:
 
 | Mode | How it works | Pros | Cons |
 |---|---|---|---|
-| **`cut`** (default, current) | Delete word spans, splice original audio, export AAF | Lossless voice, fast, deterministic, editable in Premiere | Hard edit points; needs padding/clamp care |
+| **`cut`** (default, current) | Delete word spans, splice original audio, export Premiere project | Lossless voice, fast, deterministic, editable in Premiere | Hard edit points; needs padding/clamp care |
 | **`generative`** (new) | Identify mis-speak spans, instruct AuK to remove/regenerate | **Seamless** — no edit points | Generated voice (slight timbre drift), slower, GPU-heavy; no meaningful AAF |
 | **`hybrid`** (optional) | Cut for large deletions, AuK only for small in-word touch-ups | Best of both | Most complex |
 
@@ -83,7 +83,7 @@ faithful_transcribe.py (verbatim ASR, word timestamps)
         ▼
 llm_dedup_words()  ──►  deleted word indices  →  deleted spans (start, end, text)
         │
-        ├── cut        → clean_keep_blocks → _splice_keep → WAV / FLAC / MP3 + AAF
+        ├── cut        → clean_keep_blocks → _splice_keep → WAV / FLAC / MP3 + Premiere project
         │
         └── generative → build AuK instruction(s) → AuK edit → rendered WAV
 ```
@@ -126,7 +126,7 @@ the model is trained on short segments. A 47-minute narration therefore needs:
 
 There are already **two** Python environments in this project:
 
-- the server **venv** (Python 3.12) — Flask, openai, pydub, pyaaf2;
+- the server **venv** (Python 3.12) — Flask, openai;
 - the **transcription** interpreter (Python 3.14 + CUDA torch) — CrisperWhisper.
 
 AuK requires **Python 3.10** (uv/conda) with its own torch stack, and possibly a
@@ -175,14 +175,14 @@ progress back to the UI.
 - [ ] Build `dedup.py` → instruction-text mapping (group spans, merge nearby, recover text,
       classify content vs nonverbal).
 - [ ] Chunk long audio into windows at pauses; stitch with crossfade.
-- [ ] Emit a rendered WAV; write a debug log like the existing `output/debug.log`.
+- [ ] Emit a rendered WAV; write a debug log like the existing `.work/debug.log`.
 
 ### P2 — Pipeline + UI wiring
 - [ ] Add `dedup_method` ("cut" | "generative") to the Flask form and to `dedup_audio`.
 - [ ] Route the pipeline: `generative` → `auk_edit.py` instead of `_splice_keep`.
 - [ ] Progress reporting (reuse the existing SSE + subprocess-reader pattern).
-- [ ] Keep AAF export for `cut`; for `generative`, return the rendered WAV (document why
-      AAF is not meaningful for regenerated audio).
+- [ ] Keep the Premiere project for `cut`; for `generative`, return the rendered WAV (document why
+      a cut list is not meaningful for regenerated audio).
 
 ### P3 — Quality, speed, evaluation
 - [ ] Objective + subjective A/B: cut vs generative vs original, on a fixed test set.
@@ -206,7 +206,7 @@ progress back to the UI.
 | **Latency / VRAM** | Diffusion inference is far slower than cutting. AuK-Flash (4-step) is the practical default; batch windows where possible. |
 | **Env complexity** | A third Python env is real maintenance cost. Consider a single local HTTP service wrapping AuK, so the server talks to it over `localhost`. |
 | **Determinism** | Diffusion is stochastic; cut is deterministic. Generative output may vary run-to-run — pin seeds if reproducibility is needed. |
-| **Not a Premiere workflow** | Generative output is a rendered file, so the "import AAF and correct by hand in Premiere" workflow does not apply in this mode. |
+| **Not a Premiere workflow** | Generative output is a rendered file, so the "open the project and correct by hand in Premiere" workflow does not apply in this mode. |
 
 ---
 

@@ -1,11 +1,12 @@
 """
 音频自动去重/去空 Web 界面（Flask + SSE 实时进度）
 - 定位说话内容并拼接：只保留说话片段，切掉空隙，保持原始采样率/声道
-- 可选 LLM(OpenAI 兼容, 任意 chat.completions / responses 端点) 智能判重
-- 输出可选 wav（无损）/ mp3（高码率）
+- LLM(OpenAI 兼容, 任意 chat.completions / responses 端点) 智能判重
+- 输出音频（wav / flac / mp3）和视频、音频都剪好的 Premiere 工程
 """
-import os, uuid, json, time, re, threading, traceback, shutil, tempfile, glob
+import os, uuid, json, time, re, threading, traceback, shutil, tempfile, glob, socket
 import sys
+from typing import Optional
 from urllib.parse import urlsplit
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -21,6 +22,7 @@ os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_HERE, ".hf-cache"))
 from dedup import dedup_audio, new_job_dir, output_extension, WORK_DIR
 
 app = Flask(__name__)
+HOST, PORT = "127.0.0.1", 7861
 OUT_DIR = os.path.join(_HERE, "output")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -32,6 +34,10 @@ tempfile.tempdir = TMP_DIR
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+# 进行中任务预留的输出文件名（不含扩展名、统一小写），由 _jobs_lock 保护
+_reserved_stems: set = set()
+# 一次只跑一个任务：两个任务同时把模型加载到 GPU 容易显存不足，其余任务排队
+_run_lock = threading.Lock()
 
 _AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".mp4", ".aac")
 
@@ -48,24 +54,47 @@ def _clean_stale_work() -> None:
             pass
 
 
+def _claim_port() -> Optional[socket.socket]:
+    """占住服务端口；已被占用（服务很可能已在运行）时返回 None。"""
+    s = socket.socket()
+    try:
+        s.bind((HOST, PORT))
+    except OSError:
+        s.close()
+        return None
+    return s
+
+
 def _safe_name(name: str) -> str:
     name = os.path.basename(name or "").strip()
     return re.sub(r"[^\w.\-]", "_", name)
 
 
 def _out_path(input_filename: str, user_outname: str, ext: str) -> str:
-    """output 里的目标路径：扩展名用真实格式，音频和同名 AAF 都不覆盖已有文件。"""
+    """output 里的目标路径：扩展名用真实格式，音频和同名 Premiere 工程都不覆盖已有文件。
+
+    同时预留文件名，避免排队中或进行中的任务写到同一个文件；任务结束时用 _release_out_path 释放。
+    """
     stem = _safe_name(user_outname) if user_outname and user_outname.strip() else ""
     if stem.lower().endswith(_AUDIO_EXTS):
         stem = os.path.splitext(stem)[0]
     if not stem:
         stem = _safe_name(os.path.splitext(os.path.basename(input_filename))[0]) + "_deduped"
     candidate, i = stem, 0
-    while (os.path.exists(os.path.join(OUT_DIR, candidate + ext))
-           or os.path.exists(os.path.join(OUT_DIR, candidate + ".aaf"))):
-        i += 1
-        candidate = f"{stem}_{i}"
+    with _jobs_lock:
+        while (candidate.lower() in _reserved_stems
+               or os.path.exists(os.path.join(OUT_DIR, candidate + ext))
+               or os.path.exists(os.path.join(OUT_DIR, candidate + ".prproj"))
+               or os.path.exists(os.path.join(OUT_DIR, candidate + ".xml"))):
+            i += 1
+            candidate = f"{stem}_{i}"
+        _reserved_stems.add(candidate.lower())
     return os.path.join(OUT_DIR, candidate + ext)
+
+
+def _release_out_path(path: str) -> None:
+    with _jobs_lock:
+        _reserved_stems.discard(os.path.splitext(os.path.basename(path))[0].lower())
 
 
 def _is_local_request() -> bool:
@@ -74,6 +103,13 @@ def _is_local_request() -> bool:
         return False
     origin = request.headers.get("Origin")
     return not origin or urlsplit(origin).netloc == request.host
+
+
+@app.before_request
+def _only_this_machine():
+    # 所有路由都检查：Host 校验挡住 DNS rebinding，否则别的网页能读到 output 里的结果
+    if not _is_local_request():
+        return {"error": "Only requests from this machine's own page are accepted."}, 403
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -89,22 +125,22 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .bar-wrap{height:12px;background:#e5e7eb;border-radius:6px;margin-top:14px;overflow:hidden}
  .bar{height:100%;width:0;background:#2563eb;transition:width .3s}
  #status{margin-top:10px;font-size:14px;white-space:pre-wrap}
- .done{color:#059669;font-weight:600} .err{color:#dc2626}
+ .done{color:#059669;font-weight:600} .err{color:#dc2626} .warn{color:#b45309;font-size:14px}
  a{color:#2563eb} audio{width:100%;margin-top:12px;border-radius:8px}
  .row{display:flex;gap:12px} .row>div{flex:1}
 </style></head><body>
 <h1>🎙️ Speech Extraction + Dedup</h1>
-<p class="muted">Keeps only the speech segments and splices them together (automatic silence/pause removal), preserving the original sample rate and channels. Your input file is never modified.</p>
+<p class="muted">Removes silences, mis-speaks and restarts, then gives you clean audio plus a Premiere project with the video and audio cut. Premiere opens briefly at the end of a run, so close it first. Your input file is never modified.</p>
 
 <div id="formwrap">
 <form id="f">
  <label>Local file path (recommended for large files: read in place, no upload or copy)</label><input name="local_path" placeholder="F:\\videos\\talk.mp4">
  <label>Or upload a file</label><input type="file" name="audio" accept="audio/*,video/*">
- <label>OpenAI-compatible API URL</label><input name="api_url" placeholder="https://api.openai.com/v1">
- <label>Model name</label><input name="model" placeholder="gpt-4o-mini">
- <label>API key</label><input name="api_key" type="password">
+ <label>OpenAI-compatible API URL</label><input name="api_url" placeholder="https://api.deepseek.com" required>
+ <label>Model name</label><input name="model" placeholder="deepseek-flash" required>
+ <label>API key</label><input name="api_key" type="password" required>
  <label>API type</label><select name="api_mode">
-   <option value="auto" selected>Auto (try Chat Completions, then Responses)</option>
+   <option value="auto" selected>Auto (try Responses, then Chat Completions)</option>
    <option value="chat">Chat Completions</option>
    <option value="responses">Responses</option>
  </select>
@@ -117,15 +153,12 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <select name="whisper"><option value="large" selected>large (default, most accurate)</option><option value="small">small (faster)</option></select>
    </div>
    <div><label>Silence gap (seconds, larger = keep more pauses, cut less)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
-    <div><label>Pause split sensitivity (seconds, smaller = more granular)</label><input name="pause_dur" type="number" value="0.25" step="0.05" min="0.1" max="1.5"></div>
-    
  </div>
  <div class="row">
    <div><label>Output format</label><select name="out_format"><option value="auto" selected>Match source</option><option value="wav">WAV (lossless)</option><option value="flac">FLAC (lossless)</option><option value="mp3">MP3</option></select></div>
    <div><label>MP3 bitrate</label><select name="out_bitrate"><option value="192k">192k</option><option value="320k" selected>320k</option><option value="128k">128k</option></select></div>
  </div>
- <label><input type="checkbox" name="use_llm" value="1"> Use LLM intelligent dedup (remove duplicate / redundant lines)</label>
- <label>Output file name (optional, default &lt;name&gt;_deduped.wav)</label><input name="outname" placeholder="e.g. my_clean.wav">
+ <label>Output file name (optional, default &lt;name&gt;_deduped; the extension follows the output format)</label><input name="outname" placeholder="e.g. my_clean">
  <button id="btn" type="submit">Start Processing</button>
 </form>
 </div>
@@ -139,37 +172,55 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script>
 document.getElementById('f').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const btn = document.getElementById('btn'); btn.disabled = true;
-  document.getElementById('formwrap').style.display='none';
-  const proc = document.getElementById('proc'); proc.style.display='block';
+  const el = (id) => document.getElementById(id);
+  const btn = el('btn'); btn.disabled = true;
+  el('formwrap').style.display='none';
+  el('proc').style.display='block';
+  el('res').replaceChildren();
+  el('bar').style.width = '0';
+  const resetForm = () => { btn.disabled=false; el('formwrap').style.display='block'; };
+  // 错误信息里可能有文件路径和 ffmpeg 日志，只当纯文本显示
+  const showLine = (cls, text) => { const s = document.createElement('span'); s.className = cls; s.textContent = text; el('status').replaceChildren(s); };
+  const showErr = (t) => { showLine('err', t); resetForm(); };
   const fd = new FormData();
-  for (const [k,v] of new FormData(document.getElementById('f'))) fd.append(k,v);
+  for (const [k,v] of new FormData(el('f'))) fd.append(k,v);
   const usePath = fd.get('local_path').trim() !== '';
   if (usePath) fd.delete('audio');
-  document.getElementById('status').innerText = usePath ? 'Starting…' : 'Uploading…';
+  el('status').innerText = usePath ? 'Starting…' : 'Uploading…';
   try {
     const r = await fetch('/dedup', {method:'POST', body: fd});
     const d = await r.json();
     if (d.error){ showErr(d.error); return; }
     const es = new EventSource('/progress/' + d.job_id);
+    let drops = 0;
     es.onmessage = (ev) => {
+      drops = 0;
       const m = JSON.parse(ev.data);
-      document.getElementById('bar').style.width = (m.progress*100)+'%';
-      document.getElementById('status').innerText = m.msg;
+      el('bar').style.width = (m.progress*100)+'%';
+      el('status').innerText = m.msg;
       if (m.done){
         es.close();
-        if (m.error){ showErr(m.error); }
-        else {
-          document.getElementById('status').innerHTML = '<span class="done">✅ Done: kept '+m.kept_sec+'s of '+m.total_sec+'s, removed about '+m.removed_sec+'s.</span>';
-          let resHtml = '<p><a href="/output/'+encodeURIComponent(m.outname)+'" download>⬇️ Download deduped audio</a></p><audio controls src="/output/'+encodeURIComponent(m.outname)+'"></audio>';
-          if (m.out_aaf) { resHtml += '<p><a href="/output/'+encodeURIComponent(m.out_aaf)+'" download>🎬 Download Premiere sequence (AAF)</a> <span class="muted">Import the AAF → link source media (one source) → correct manually</span></p>'; }
-          document.getElementById('res').innerHTML = resHtml;
-          btn.disabled=false; document.getElementById('formwrap').style.display='block';
+        if (m.error){ showErr(m.error); return; }
+        showLine('done', '✅ Done: kept '+m.kept_sec+'s of '+m.total_sec+'s, removed about '+m.removed_sec+'s.');
+        let resHtml = '<p><a href="/output/'+encodeURIComponent(m.outname)+'" download>⬇️ Download deduped audio</a></p><audio controls src="/output/'+encodeURIComponent(m.outname)+'"></audio>';
+        el('res').innerHTML = resHtml;
+        if (m.out_project) {
+          const p = document.createElement('p');
+          p.textContent = '🎬 Premiere project: ' + m.out_project;
+          el('res').append(p);
         }
+        for (const w of m.warnings) { const p = document.createElement('p'); p.className = 'warn'; p.textContent = '⚠️ '+w; el('res').append(p); }
+        resetForm();
+      }
+    };
+    // 浏览器会自动重连；连续失败说明服务已经关了，不要让页面一直停在进度条上
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED || ++drops >= 5) {
+        es.close();
+        showErr('Lost the connection to the server. It may have been closed, which also stops the job.');
       }
     };
   } catch(e){ showErr('Request failed: '+e); }
-  function showErr(t){ document.getElementById('status').innerHTML='<span class="err">'+t+'</span>'; btn.disabled=false; document.getElementById('formwrap').style.display='block'; }
 });
 </script>
 </body></html>"""
@@ -182,8 +233,6 @@ def index():
 
 @app.route("/dedup", methods=["POST"])
 def dedup():
-    if not _is_local_request():
-        return {"error": "Only requests from this machine's own page are accepted."}, 403
     # “复制文件地址”得到的路径带引号，这里去掉
     local_path = request.form.get("local_path", "").strip().strip('"\'').strip()
     f = request.files.get("audio")
@@ -199,12 +248,16 @@ def dedup():
     api_key = request.form.get("api_key", "").strip()
     api_mode = request.form.get("api_mode", "auto").strip() or "auto"
     whisper = request.form.get("whisper", "large")
-    keep_gap = float(request.form.get("keep_gap", "0.8") or 0.8)
-    pause_dur = float(request.form.get("pause_dur", "0.25") or 0.25)
-    seg_gap = float(request.form.get("seg_gap", "0.3") or 0.3)
+    if whisper not in ("large", "small"):
+        whisper = "large"
+    try:
+        keep_gap = float(request.form.get("keep_gap") or 0.8)
+    except ValueError:
+        keep_gap = float("nan")
+    if not 0.1 <= keep_gap <= 3:
+        return {"error": "Silence gap must be a number between 0.1 and 3 seconds."}, 400
     out_format = request.form.get("out_format", "auto")
     out_bitrate = request.form.get("out_bitrate", "320k")
-    use_llm = request.form.get("use_llm") == "1"
     language = request.form.get("language", "en").strip() or "en"
     if language not in ("en", "zh"):
         language = "en"
@@ -212,7 +265,7 @@ def dedup():
 
     if api_mode not in ("auto", "chat", "responses"):
         api_mode = "auto"
-    if use_llm and not (api_url and model and api_key):
+    if not (api_url and model and api_key):
         return {"error": "Please fill in the API URL, model name, and API key."}, 400
 
     # 所有中间文件都在 job_dir，结束时整个删除；本地路径模式的原文件不在其中，不会被动到
@@ -232,7 +285,8 @@ def dedup():
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         _jobs[job_id] = {"progress": 0.0, "msg": "Queued…", "done": False, "error": None,
-                         "kept_sec": 0.0, "removed_sec": 0.0, "total_sec": 0.0, "outname": out_url, "out_aaf": None}
+                         "kept_sec": 0.0, "removed_sec": 0.0, "total_sec": 0.0, "outname": out_url,
+                         "out_project": None, "warnings": []}
 
     def _progress(frac, msg):
         with _jobs_lock:
@@ -241,27 +295,30 @@ def dedup():
 
     def worker():
         try:
-            info = dedup_audio(audio_path, out_path, api_url=api_url, model=model, api_key=api_key,
-                               whisper_model=whisper, language=language, keep_gap=keep_gap,
-                               use_llm=use_llm, api_mode=api_mode, out_format=out_format, out_bitrate=out_bitrate,
-                               seg_gap=seg_gap, pause_dur=pause_dur, progress=_progress, work_dir=job_dir)
+            with _run_lock:
+                info = dedup_audio(audio_path, out_path, api_url=api_url, model=model, api_key=api_key,
+                                   whisper_model=whisper, language=language, keep_gap=keep_gap,
+                                   api_mode=api_mode, out_format=out_format, out_bitrate=out_bitrate,
+                                   progress=_progress, work_dir=job_dir)
             with _jobs_lock:
                 j = _jobs[job_id]
-                j["done"] = True
                 j["kept_sec"] = info["kept_sec"]
                 j["removed_sec"] = info["removed_sec"]
                 j["total_sec"] = info["total_sec"]
                 j["msg"] = "Done"
                 j["progress"] = 1.0
-                j["out_aaf"] = os.path.basename(info["out_aaf"]) if info.get("out_aaf") else None
+                j["out_project"] = info.get("out_project")
+                j["warnings"] = info.get("warnings", [])
+                j["done"] = True
         except Exception as e:
             traceback.print_exc()
             with _jobs_lock:
-                _jobs[job_id]["done"] = True
                 _jobs[job_id]["error"] = str(e)
                 _jobs[job_id]["msg"] = "Error"
+                _jobs[job_id]["done"] = True
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
+            _release_out_path(out_path)
 
     threading.Thread(target=worker, daemon=True).start()
     return {"job_id": job_id}
@@ -272,19 +329,19 @@ def progress(job_id):
     def gen():
         last = None
         while True:
+            # 在锁内取快照：否则可能读到 done=True 而结果字段还没写好的中间状态
             with _jobs_lock:
                 j = _jobs.get(job_id)
-            if j is None:
-                yield "data: {}\n\n"
+                snapshot = dict(j) if j else None
+            if snapshot is None:
+                yield "data: " + json.dumps({"progress": 0.0, "msg": "Error", "done": True,
+                                             "error": "Job not found. The server may have been restarted."}) + "\n\n"
                 break
-            data = json.dumps({"progress": j["progress"], "msg": j["msg"], "done": j["done"],
-                               "error": j["error"], "kept_sec": j["kept_sec"],
-                               "removed_sec": j["removed_sec"], "total_sec": j["total_sec"],
-                               "outname": j["outname"], "out_aaf": j["out_aaf"]})
+            data = json.dumps(snapshot)
             if data != last:
                 last = data
                 yield "data: " + data + "\n\n"
-            if j["done"]:
+            if snapshot["done"]:
                 break
             time.sleep(0.3)
     return Response(gen(), mimetype="text/event-stream")
@@ -296,5 +353,12 @@ def out_file(name):
 
 
 if __name__ == "__main__":
+    # 先确认没有其他实例在运行，再清理 .work：否则再次启动会删掉运行中任务的文件
+    claimed = _claim_port()
+    if claimed is None:
+        print(f"Port {PORT} is already in use. If Audio Dedup is already running, "
+              f"open http://{HOST}:{PORT} in your browser.")
+        sys.exit(1)
     _clean_stale_work()
-    app.run(host="127.0.0.1", port=7861, debug=False, threaded=True)
+    claimed.close()
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
