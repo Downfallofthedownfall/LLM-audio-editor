@@ -155,7 +155,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div><label>Silence gap (seconds, larger = keep more pauses, cut less)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
  </div>
  <div class="row">
-   <div><label>Output format</label><select name="out_format"><option value="auto" selected>Match source</option><option value="wav">WAV (lossless)</option><option value="flac">FLAC (lossless)</option><option value="mp3">MP3</option></select></div>
+   <div><label>Output format</label><select name="out_format"><option value="flac" selected>FLAC (lossless)</option><option value="wav">WAV (lossless)</option><option value="auto">Match source (re-encodes if the source is lossy)</option><option value="mp3">MP3</option></select></div>
    <div><label>MP3 bitrate</label><select name="out_bitrate"><option value="192k">192k</option><option value="320k" selected>320k</option><option value="128k">128k</option></select></div>
  </div>
  <label>Output file name (optional, default &lt;name&gt;_deduped; the extension follows the output format)</label><input name="outname" placeholder="e.g. my_clean">
@@ -209,6 +209,14 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
           p.textContent = '🎬 Premiere project: ' + m.out_project;
           el('res').append(p);
         }
+        if (m.out_cuts) {
+          const p = document.createElement('p'), a = document.createElement('a');
+          a.href = '/output/' + encodeURIComponent(m.out_cuts);
+          a.target = '_blank';
+          a.textContent = '📝 Cut list: read what was deleted';
+          p.append(a);
+          el('res').append(p);
+        }
         for (const w of m.warnings) { const p = document.createElement('p'); p.className = 'warn'; p.textContent = '⚠️ '+w; el('res').append(p); }
         resetForm();
       }
@@ -222,6 +230,13 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
     };
   } catch(e){ showErr('Request failed: '+e); }
 });
+// 记住上次的设置，不用每次重填。API key 和文件路径不存
+const SAVED_FIELDS = ['api_url','model','api_mode','language','whisper','keep_gap','out_format','out_bitrate'];
+const form = document.getElementById('f');
+const saved = JSON.parse(localStorage.getItem('settings') || '{}');
+for (const k of SAVED_FIELDS) { if (saved[k]) form.elements[k].value = saved[k]; }
+form.addEventListener('submit', () => localStorage.setItem('settings',
+  JSON.stringify(Object.fromEntries(SAVED_FIELDS.map((k) => [k, form.elements[k].value])))));
 </script>
 </body></html>"""
 
@@ -286,7 +301,7 @@ def dedup():
     with _jobs_lock:
         _jobs[job_id] = {"progress": 0.0, "msg": "Queued…", "done": False, "error": None,
                          "kept_sec": 0.0, "removed_sec": 0.0, "total_sec": 0.0, "outname": out_url,
-                         "out_project": None, "warnings": []}
+                         "out_project": None, "out_cuts": None, "warnings": []}
 
     def _progress(frac, msg):
         with _jobs_lock:
@@ -308,6 +323,7 @@ def dedup():
                 j["msg"] = "Done"
                 j["progress"] = 1.0
                 j["out_project"] = info.get("out_project")
+                j["out_cuts"] = os.path.basename(info["out_cuts"]) if info.get("out_cuts") else None
                 j["warnings"] = info.get("warnings", [])
                 j["done"] = True
         except Exception as e:
