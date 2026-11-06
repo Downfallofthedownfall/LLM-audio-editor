@@ -16,6 +16,8 @@ except Exception:
     pass
 from typing import List, Dict, Optional, Tuple, Set
 
+import numpy as np
+
 import premiere
 
 # 让模型/依赖的缓存落在工作区内（Windows 沙箱限制 C:\Users 下缓存写入）
@@ -707,40 +709,139 @@ def llm_dedup_words(words: List[Dict], llm: _LLMClient, progress=None,
     return sorted(deleted), failures, total
 
 
-def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.4,
-                      pad: float = 0.06) -> List[Tuple[float, float]]:
+# ---- 用真实音频校准切点 ----
+# 词时间戳会把词框窄：实测词尾平均比声音结束早约 90 ms、词头平均晚约 80 ms，个别差几百毫秒。
+# 直接切在时间戳上，就会切掉保留词的尾音、带进被删词的尾音，所以要在时间戳附近找真实的声音空隙。
+_ENV_RATE = 200           # 响度包络每秒帧数（5 ms 一帧）
+_ENV_WINDOW = 160         # 16 kHz 下的 10 ms 窗
+_ENV_HOP = 80             # 16 kHz 下的 5 ms 步长
+_MIN_VALLEY_SEC = 0.04    # 低于门限持续这么久才算空隙，更短的多半是词内的塞音
+_MIN_CONTRAST_DB = 12     # 附近最响和最安静至少差这么多，才能靠响度判断空隙
+_SEARCH_SEC = 0.35        # 从时间戳往词外最多找这么远
+_NEIGHBOR_SLACK_SEC = 0.10  # 可以越过邻词时间戳这么多：时间戳紧贴时，真实空隙常在它后面一点
+_VALLEY_REACH_SEC = 0.3   # 量空隙长度时可以超出搜索范围，否则范围边缘的长空隙会被算短
+_TAIL_SEC = 0.04          # 声音结束后再留一点，保住余音
+_LEAD_SEC = 0.03          # 声音开始前留一点，保住起音
+
+
+def _loudness_envelope(path: str) -> np.ndarray:
+    """流式解码成 16 kHz 单声道，返回每 5 ms 一帧的响度（dB）。内存只和帧数有关：一小时约 3 MB。"""
+    proc = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0", "-vn",
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    parts = []
+    tail = np.zeros(0, dtype=np.float64)
+    pending = b""
+    while True:
+        buf = proc.stdout.read(_PIPE_CHUNK)
+        if not buf:
+            break
+        buf = pending + buf
+        usable = len(buf) - len(buf) % 2  # 读取可能停在半个采样上
+        pending = buf[usable:]
+        samples = np.concatenate((tail, np.frombuffer(buf[:usable], dtype=np.int16).astype(np.float64)))
+        frames = (len(samples) - _ENV_WINDOW) // _ENV_HOP + 1
+        if frames <= 0:
+            tail = samples
+            continue
+        energy = np.cumsum(np.concatenate(([0.0], samples ** 2)))
+        starts = _ENV_HOP * np.arange(frames)
+        parts.append(10 * np.log10((energy[starts + _ENV_WINDOW] - energy[starts]) / _ENV_WINDOW + 1.0).astype(np.float32))
+        tail = samples[_ENV_HOP * frames:]
+    if proc.wait() != 0 or not parts:
+        raise RuntimeError("Cannot read an audio stream from: " + path)
+    return np.concatenate(parts)
+
+
+def _env_frame(env: np.ndarray, t: float) -> int:
+    return max(0, min(len(env), int(round(t * _ENV_RATE))))
+
+
+def _valleys(env: np.ndarray, lo: int, hi: int) -> List[Tuple[int, int]]:
+    """[lo, hi) 里所有够长的安静段。门限按前后 5 秒的音量定，适应不同音量和底噪。"""
+    around = env[max(0, lo - 1000):hi + 1000]
+    floor, speech = np.percentile(around, 5), np.percentile(around, 95)
+    if speech - floor < _MIN_CONTRAST_DB:  # 响度几乎不变（持续噪声等），分不出哪里是空隙
+        return []
+    quiet = env[lo:hi] <= max(floor + 8, speech - 28)
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], quiet.astype(np.int8), [0]))))
+    shortest = int(_MIN_VALLEY_SEC * _ENV_RATE)
+    return [(lo + a, lo + b) for a, b in zip(edges[::2], edges[1::2]) if b - a >= shortest]
+
+
+def _sound_end(env: np.ndarray, end: float, next_start: float) -> Optional[float]:
+    """保留词真正结束的位置；附近没有空隙（连读）时返回 None。
+
+    词尾时间戳几乎只会偏早，所以只往后找，第一个空隙就是词的结尾。不选最长的空隙：
+    它可能在下一个词的第一个音节之后，那样会把被删词的开头带进来。
+    """
+    lo = _env_frame(env, end)
+    hi = _env_frame(env, min(next_start + _NEIGHBOR_SLACK_SEC, end + _SEARCH_SEC))
+    if hi <= lo:
+        return None
+    reach = int(_VALLEY_REACH_SEC * _ENV_RATE)
+    valleys = [v for v in _valleys(env, max(0, lo - reach), min(len(env), hi + reach)) if v[1] > lo and v[0] < hi]
+    if not valleys:
+        return None
+    a, b = valleys[0]
+    return float(min(max(a, lo) + _TAIL_SEC * _ENV_RATE, b) / _ENV_RATE)
+
+
+def _sound_start(env: np.ndarray, start: float, prev_end: float) -> Optional[float]:
+    """保留词真正开始的位置；附近没有空隙（连读）时返回 None。
+
+    词头时间戳多半偏晚，所以往前找，离词最近的空隙结束处就是词的开头。
+    不越过上一个词的词尾时间戳太多，否则会退回到被删词内部的停顿，把被删词的后半段带进来。
+    """
+    lo = _env_frame(env, max(prev_end - _NEIGHBOR_SLACK_SEC, start - _SEARCH_SEC))
+    hi = _env_frame(env, start)
+    if hi <= lo:
+        return None
+    reach = int(_VALLEY_REACH_SEC * _ENV_RATE)
+    valleys = [v for v in _valleys(env, max(0, lo - reach), min(len(env), hi + reach)) if v[1] > lo and v[0] < hi]
+    if not valleys:
+        return None
+    a, b = valleys[-1]
+    return float(max(b - _LEAD_SEC * _ENV_RATE, a) / _ENV_RATE)
+
+
+def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.4, pad: float = 0.06,
+                      env: Optional[np.ndarray] = None) -> List[Tuple[float, float]]:
     """直接从「保留词」构建保留块。
 
-    被删的词会在中途切断块（不跨越删除区合并），因此被删的整段——连同它周边的
-    微秒残响——都不会出现在输出里，避免脏残留 / 咔哒声。保留块内部保留 <=keep_gap
-    的自然停顿，并在块边缘加 pad 以便干净剪切。关键是：**pad 不会越过相邻被删词
-    的边界**（clamp 到被删词的 start/end），所以被删口误的边缘残响不会被带回来
-    （消除"pad 截断"声）。最后合并因 pad 而相接/重叠的块。
+    被删的词会在中途切断块（不跨越删除区合并），保留块内部保留 <=keep_gap 的自然停顿。
+    块的两端先按时间戳加 pad，且 pad 不越过相邻被删词的边界。传入 env（响度包络）时，再把两端
+    校准到真实的声音空隙上，保住保留词的尾音，也不带进被删词的尾音；找不到空隙的一端保持不变。
+    最后合并相接/重叠的块。
     """
-    blocks: List[Tuple[float, float]] = []
+    runs: List[Tuple[int, int, float]] = []
     del_spans: List[Tuple[float, float]] = []
-    cur_s = cur_e = None
+    first = last = None
+    cur_e = 0.0
     for i, w in enumerate(words):          # words 已是时间顺序
         s, e = float(w["start"]), float(w["end"])
         if i in del_set:
             # 被删的词：立即闭合当前块，让删除区彻底断开
-            if cur_s is not None:
-                blocks.append((cur_s, cur_e))
-                cur_s = cur_e = None
+            if first is not None:
+                runs.append((first, last, cur_e))
+                first = None
             del_spans.append((s, e))
             continue
-        if cur_s is None:
-            cur_s, cur_e = s, e
+        if first is None:
+            first, last, cur_e = i, i, e
         elif s - cur_e <= keep_gap:
-            cur_e = max(cur_e, e)
+            last, cur_e = i, max(cur_e, e)
         else:
-            blocks.append((cur_s, cur_e))
-            cur_s, cur_e = s, e
-    if cur_s is not None:
-        blocks.append((cur_s, cur_e))
+            runs.append((first, last, cur_e))
+            first, last, cur_e = i, i, e
+    if first is not None:
+        runs.append((first, last, cur_e))
     del_spans.sort()
-    padded: List[Tuple[float, float]] = []
-    for s, e in blocks:
+
+    blocks: List[Dict] = []
+    for a, b, e in runs:
+        s = float(words[a]["start"])
         if e - s <= 0.02:
             continue
         ps, pe = max(0.0, s - pad), e + pad
@@ -754,9 +855,19 @@ def clean_keep_blocks(words: List[Dict], del_set: Set[int], keep_gap: float = 0.
             i2 -= 1
         if i2 < len(del_spans):
             pe = min(pe, del_spans[i2][0])
-        if pe > ps:
-            padded.append((ps, pe))
-    # 合并因 pad 而相接/重叠的相邻块，避免拼接时同一段被重复（叠音/没对齐）
+        block = {"first": a, "last": b, "stamp_start": ps, "stamp_end": pe, "start": ps, "end": pe}
+        if env is not None:
+            sound_start = _sound_start(env, s, float(words[a - 1]["end"]) if a > 0 else 0.0)
+            sound_end = _sound_end(env, e, float(words[b + 1]["start"]) if b + 1 < len(words) else float("inf"))
+            block["start"] = ps if sound_start is None else sound_start
+            block["end"] = pe if sound_end is None else sound_end
+        blocks.append(block)
+    # 很短的被删词两侧的切点可能校准到一起，两块一合并，被删词就留下来了：这一处退回时间戳
+    for prev, cur in zip(blocks, blocks[1:]):
+        if cur["first"] > prev["last"] + 1 and cur["start"] <= prev["end"]:
+            prev["end"], cur["start"] = prev["stamp_end"], cur["stamp_start"]
+    padded = [(block["start"], block["end"]) for block in blocks if block["end"] > block["start"]]
+    # 合并相接/重叠的相邻块，避免拼接时同一段被重复（叠音/没对齐）
     merged: List[Tuple[float, float]] = []
     for s, e in padded:
         if merged and s <= merged[-1][1]:
@@ -820,8 +931,9 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
          % (len(llm_indices), auto_count,
             [(round(words[i]['start'],2), round(words[i]['end'],2)) for i in sorted(del_set)]))
 
-    # 直接从「保留词」构建保留块：被删的词整段消失、不留 pad 残响；keep_gap 用前端设置控制切分强度
-    keep = clean_keep_blocks(words, del_set, keep_gap=keep_gap, pad=0.06)
+    # 直接从「保留词」构建保留块，切点校准到真实音频的空隙上；keep_gap 用前端设置控制切分强度
+    _report(progress, 0.9, "Refining the cut points on the audio…")
+    keep = clean_keep_blocks(words, del_set, keep_gap=keep_gap, pad=0.06, env=_loudness_envelope(audio_path))
     _dbg("keep blocks after LLM = %d: %s" % (len(keep), [(round(s,2), round(e,2)) for s,e in keep[:40]]))
     if not keep:
         raise RuntimeError("Nothing left after filtering.")

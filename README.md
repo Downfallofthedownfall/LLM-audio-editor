@@ -26,8 +26,9 @@ parts.
    earlier repeats"** rule, and returns the indices to delete.
 4. **Guaranteed cleanups** — bracketed vocal sounds and core fillers are always removed,
    independent of the LLM.
-5. **Re-assembly** — keeps only the non-deleted words (deleted words break the block, so
-   no residue / clicks) and concatenates them cleanly.
+5. **Re-assembly** — keeps only the non-deleted words (deleted words break the block) and
+   snaps each cut to a real gap in the audio, because word timestamps alone clip endings and
+   let the tail of a deleted word through.
 6. **Export** — a clean `wav` / `flac` / `mp3`, plus a **Premiere Pro project** whose sequence
    cuts the original video and audio together, for human correction.
 
@@ -93,7 +94,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-This installs Flask and openai.
+This installs Flask, openai, and numpy.
 
 ### 2. Transcription environment (CUDA PyTorch, separate interpreter)
 
@@ -219,8 +220,10 @@ Root Folder
 - **Warning: "Premiere cannot read this file format"** — Premiere does not open every container
   (MKV is the common case, and it is OBS's default). Convert it first, then run on the MP4:
   `ffmpeg -i input.mkv -c copy output.mp4`.
-- **Clicks / residue at cut points** — fixed by building keep blocks from kept words
-  only, so deleted segments (including their padding) are removed entirely.
+- **Clicks / residue at cut points** — each cut is snapped to a quiet gap near the word's
+  timestamp. If words run together there is no gap to find, so that cut stays on the timestamp
+  and can still sound abrupt. The search constants are at the top of the cut-refinement code
+  in `dedup.py`.
 - **Slow on long files** — the transformers backend is slower than CTranslate2 on
   Windows; the tool chunk-transcribes and streams progress so it is never "stuck". Jobs run
   one at a time; a second job waits in the queue.
