@@ -118,32 +118,80 @@ def _load_words(path: str) -> List[Dict]:
     return [{"word": w["word"], "start": float(w["start"]), "end": float(w["end"])} for w in data]
 
 
-def transcribe(audio_path: str, model_size: str = "large", language: str = "en", progress=None,
-               *, work_dir: str) -> List[Dict]:
-    """用 CrisperWhisper verbatim 转写（全局 Python 3.14 + torch），返回词级 token 列表。
+# 转写子进程被系统异常终止（原生崩溃，不是脚本自己报错退出）时，重新启动的次数和等待秒数。
+# 最常见的原因是提交内存（物理内存 + 页面文件）用尽：Windows 扩大页面文件期间内存申请会被拒绝，
+# PyTorch 的分配器随即访问冲突。等几秒再启动，页面文件通常已经扩好
+_CRASH_RETRIES = 1
+_CRASH_RETRY_WAIT = 5.0
+# large 模型转写时提交内存峰值约 17 GB（实测）。崩溃时可用量低于这个数，就提示是内存不足
+_LOW_COMMIT_GB = 18.0
+# 被系统终止时的退出码（Windows NTSTATUS）。Ctrl+C（0xC000013A）是用户主动中断，不算崩溃
+_NT_STATUS_NAMES = {
+    0xC0000005: "access violation",
+    0xC0000017: "out of memory",
+    0xC000001D: "illegal instruction",
+    0xC00000FD: "stack overflow",
+    0xC000012D: "commit limit reached",
+    0xC0000374: "heap corruption",
+    0xC0000409: "fatal runtime error",
+}
+_NT_CONTROL_C_EXIT = 0xC000013A
 
-    本地路径的文件转写过一次就保存下来，重跑时直接复用。
-    子进程分块转写并实时把 STAGE/PROGRESS 打到 stdout，本函数用 Popen + 读线程
+
+def _commit_memory_gb() -> Optional[Tuple[float, float]]:
+    """Windows 上返回 (可用提交内存, 提交上限)，单位 GB；其他系统或读不到时返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32)] + [
+                (name, ctypes.c_uint64) for name in (
+                    "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                    "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return status.ullAvailPageFile / 2 ** 30, status.ullTotalPageFile / 2 ** 30
+    except Exception:
+        return None
+
+
+def _crash_name(rc: int) -> Optional[str]:
+    """退出码表示进程被系统异常终止时返回可读的名字，否则（正常退出或脚本自己报错）返回 None。"""
+    if os.name == "nt":
+        code = rc & 0xFFFFFFFF
+        if code < 0xC0000000 or code == _NT_CONTROL_C_EXIT:
+            return None
+        name = _NT_STATUS_NAMES.get(code)
+        return "0x%08X%s" % (code, ", " + name if name else "")
+    return "signal %d" % -rc if rc < 0 else None
+
+
+def _crash_message(crash: str, attempts: int, memory: Optional[Tuple[float, float]], model_size: str) -> str:
+    """转写子进程崩溃后给用户看的说明：这不是转写内容的问题，并指出最可能的原因。"""
+    msg = "CrisperWhisper crashed (%s)%s. This is a crash inside PyTorch/CUDA, not a problem with the audio." % (
+        crash, " %d times in a row" % attempts if attempts > 1 else "")
+    if memory and memory[0] < _LOW_COMMIT_GB:
+        msg += " Windows was low on memory: %.1f GB of %.1f GB (RAM + page file) was free when it started" % memory
+        msg += ", and the large model needs about 17 GB." if model_size == "large" else "."
+        msg += " Close memory-heavy apps (Premiere, browsers, games) or enlarge the page file, then run again."
+    else:
+        msg += " The Python stack at the crash is in .work\\debug.log."
+    return msg
+
+
+def _run_transcriber(cmd: List[str], model_size: str, progress) -> Tuple[int, List[str], List[str]]:
+    """运行一次转写子进程。返回 (退出码, 脚本报告的 ERR 行, 最后几行输出)。
+
+    子进程分块转写并实时把 STAGE/PROGRESS 打到 stdout，这里用 Popen + 读线程
     解析并转给 UI，避免长音频看起来像卡住。
     """
-    script = os.path.join(_HERE, "faithful_transcribe.py")
-    cache = None if _is_upload(audio_path, work_dir) else _transcript_cache_path(audio_path, model_size, language, script)
-    if cache and os.path.isfile(cache):
-        try:
-            tokens = _load_words(cache)
-        except Exception as e:
-            tokens = []
-            _dbg("[warn] ignoring the saved transcript %s: %r" % (cache, str(e)[:200]))
-        if tokens:
-            _dbg("reusing saved transcript %s (%d words)" % (cache, len(tokens)))
-            _report(progress, 0.70, f"Reusing the saved transcript: {len(tokens)} words")
-            return tokens
-    tmp = os.path.join(work_dir, "words.json")
-    _report(progress, 0.08, f"Loading CrisperWhisper ({model_size}, verbatim)…")
-    _dbg("faithful transcribe (streaming) via global py-3.14, model=%s" % model_size)
-
     proc = subprocess.Popen(
-        ["py", "-3.14", script, audio_path, tmp, model_size, "30", "27", str(language)],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
         env=dict(os.environ, PYTHONIOENCODING="utf-8"),
@@ -151,7 +199,7 @@ def transcribe(audio_path: str, model_size: str = "large", language: str = "en",
     # 进度锚点（占总进度 0.08→0.70，后面留给 LLM 和拼接）
     f0, f1, span = 0.08, 0.15, 0.55
     errors: List[str] = []
-    tail = collections.deque(maxlen=5)  # 进程意外崩溃时（没有 ERR 行）用来说明原因
+    tail = collections.deque(maxlen=5)  # 脚本没有报 ERR 就退出时用来说明原因
 
     def _reader():
         for line in proc.stdout:
@@ -184,6 +232,45 @@ def transcribe(audio_path: str, model_size: str = "large", language: str = "en",
     th.start()
     rc = proc.wait()
     th.join(timeout=2.0)
+    return rc, errors, list(tail)
+
+
+def transcribe(audio_path: str, model_size: str = "large", language: str = "en", progress=None,
+               *, work_dir: str) -> List[Dict]:
+    """用 CrisperWhisper verbatim 转写（全局 Python 3.14 + torch），返回词级 token 列表。
+
+    本地路径的文件转写过一次就保存下来，重跑时直接复用。
+    子进程原生崩溃（多为内存不足）时重新启动一次，仍然崩溃才让任务失败。
+    """
+    script = os.path.join(_HERE, "faithful_transcribe.py")
+    cache = None if _is_upload(audio_path, work_dir) else _transcript_cache_path(audio_path, model_size, language, script)
+    if cache and os.path.isfile(cache):
+        try:
+            tokens = _load_words(cache)
+        except Exception as e:
+            tokens = []
+            _dbg("[warn] ignoring the saved transcript %s: %r" % (cache, str(e)[:200]))
+        if tokens:
+            _dbg("reusing saved transcript %s (%d words)" % (cache, len(tokens)))
+            _report(progress, 0.70, f"Reusing the saved transcript: {len(tokens)} words")
+            return tokens
+    tmp = os.path.join(work_dir, "words.json")
+    # faulthandler：原生崩溃时把 Python 调用栈打出来（进 debug.log），否则只有一个退出码
+    cmd = ["py", "-3.14", "-X", "faulthandler", script, audio_path, tmp, model_size, "30", "27", str(language)]
+    for attempt in itertools.count(1):
+        _report(progress, 0.08, f"Loading CrisperWhisper ({model_size}, verbatim)…")
+        memory = _commit_memory_gb()
+        _dbg("faithful transcribe (streaming) via global py-3.14, model=%s%s" % (
+            model_size, ", commit memory free %.1f of %.1f GB" % memory if memory else ""))
+        rc, errors, tail = _run_transcriber(cmd, model_size, progress)
+        crash = _crash_name(rc) if rc != 0 else None
+        if not crash or attempt > _CRASH_RETRIES:
+            break
+        _dbg("[warn] the transcriber crashed (%s) on attempt %d, starting it again" % (crash, attempt))
+        _report(progress, 0.08, "The transcriber crashed (%s), starting it again…" % crash)
+        time.sleep(_CRASH_RETRY_WAIT)
+    if crash:
+        raise RuntimeError(_crash_message(crash, attempt, memory, model_size))
     if rc != 0:
         detail = errors[-1] if errors else " | ".join(tail)
         raise RuntimeError("CrisperWhisper failed (exit %d): %s" % (rc, detail[-500:]))

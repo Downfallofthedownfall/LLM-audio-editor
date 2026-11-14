@@ -235,6 +235,13 @@ Root Folder
 - **"CrisperWhisper failed (exit 1): ..."** — the message after the colon is the cause. If
   the model cannot be loaded on a first run, check the internet connection: a model that is
   not fully cached has to be downloaded into `HF_HOME`.
+- **"CrisperWhisper crashed (0xC0000005, access violation)"** — the transcriber was killed by
+  Windows instead of reporting an error; the tool has already started it a second time. The usual
+  cause is memory: the large model needs about 17 GB of free commit (RAM + page file), mostly
+  while the first chunk runs, and PyTorch crashes instead of raising an error when Windows cannot
+  provide it. Close memory-heavy apps (Premiere, browsers, games), or give the page file a larger
+  fixed size on a drive with free space, then run again. `.work\debug.log` records the free
+  memory at the start of each attempt and the Python stack at the crash.
 - **"LLM API check failed"** — the URL, model name, or key was rejected. Nothing has been
   transcribed yet, so fix the form and run again.
 - **Warning: "LLM dedup failed for N of M windows"** — the audio was still produced, but
