@@ -157,9 +157,11 @@ is loaded **offline**.
 - **Dedup** favors quality over speed and cost. It requests high reasoning effort
   (`REASONING_EFFORT` in `dedup.py`), and sends the transcript in **windows** of 300 words with
   150 words of read-only context on both sides. It sets no output token limit, so the answer is
-  not truncated by a small budget. If a provider rejects a parameter, the request is retried
-  without it, giving up JSON mode before reasoning. If no reasoning setting is accepted, the result
-  carries a warning.
+  not truncated by a small budget. The API check before transcription settles the parameters: if
+  the provider rejects one, the check is retried without it, giving up JSON mode before reasoning.
+  If no reasoning setting is accepted, the result carries a warning. The settings found by the
+  check are then used for every window. A later request can only give up JSON mode; it never
+  drops reasoning to get an answer, and a window that still fails is retried and then reported.
 - **ASR review** listens to the edit `REVIEW_PASSES` times (`dedup.py`, default 2; the web form
   offers 1 to 3). Each pass transcribes the whole edit again, on top of the first transcription:
   11 to 16 minutes for a 27-minute edit on an RTX 5070 Ti. What a pass changes can only be heard in the next
@@ -219,6 +221,13 @@ Then open **http://127.0.0.1:7861**.
   deleted after processing, so relink it by name when prompted.
 - If Premiere was open or is not installed, you get an **`.xml`** and a warning instead. Use
   `File > Import` in Premiere: the sequence is the same.
+- The sequence counts in video frames, so each cut is rounded to the nearest frame and can sit
+  up to half a frame (21 ms at 24 fps, 17 ms at 30 fps) away from the cut in the audio file. The
+  audio file is the version the ASR review listened to. A cut in a pause has 30 to 40 ms of room
+  around the word, which covers this. A cut between two words spoken without a pause has none, so
+  listen to those in the sequence.
+- If the audio track of the file starts later than the file itself, the sequence times are
+  shifted by that offset, so the cuts land on the same sound as in the audio file.
 
 ---
 

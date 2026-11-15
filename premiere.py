@@ -41,7 +41,22 @@ def _probe_media(path: str) -> Dict:
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
     if not video and not audio:
         raise RuntimeError("The source has no video or audio stream.")
-    return {"video": video, "audio": audio, "duration": float(data["format"]["duration"])}
+    return {"video": video, "audio": audio, "duration": float(data["format"]["duration"]),
+            "audio_offset": _audio_offset(audio, data.get("format") or {})}
+
+
+def _audio_offset(audio: Optional[Dict], container: Dict) -> float:
+    """音频流比文件起点晚多少秒开始（多数文件是 0）。
+
+    保留区间是按解码出来的音频计时的：ffmpeg 解码成裸 PCM 时不会补上开头这段空白，第一个采样就是 0 秒。
+    Premiere 按文件的时间放置素材，所以序列里的时间要加上这段偏移，否则每个切点都早这么多。
+    """
+    if not audio:
+        return 0.0
+    try:
+        return max(0.0, float(audio.get("start_time")) - float(container.get("start_time")))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _timeline_rate(video: Optional[Dict]) -> Tuple[int, bool]:
@@ -80,7 +95,8 @@ def write_fcp_xml(media_path: str, keep_blocks: List[Tuple[float, float]], xml_p
     fps = fractions.Fraction(timebase * 1000, 1001) if ntsc else fractions.Fraction(timebase)
     total_frames = int(round(info["duration"] * fps))
     ticks_per_frame = int(TICKS_PER_SECOND / fps)
-    spans = _frame_spans(keep_blocks, fps, total_frames)
+    offset = info["audio_offset"]
+    spans = _frame_spans([(start + offset, end + offset) for start, end in keep_blocks], fps, total_frames)
     if not spans:
         raise RuntimeError("No keep blocks for the Premiere sequence.")
 
@@ -318,6 +334,9 @@ def export_project(media_path: str, keep_blocks: List[Tuple[float, float]], out_
     xml_tmp = os.path.join(work_dir, name + ".xml")
     clip_count = write_fcp_xml(media_path, keep_blocks, xml_tmp, name)
     info = _probe_media(media_path)
+    if info["audio_offset"] >= 0.001:
+        log("premiere: the audio starts %.3f s into the file, so the sequence times are shifted by that much"
+            % info["audio_offset"])
     project_path = out_stem + ".prproj"
 
     exe = find_premiere()

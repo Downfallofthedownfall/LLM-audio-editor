@@ -72,7 +72,7 @@ def _safe_name(name: str) -> str:
 
 
 def _out_path(input_filename: str, user_outname: str, ext: str) -> str:
-    """output 里的目标路径：扩展名用真实格式，音频和同名 Premiere 工程都不覆盖已有文件。
+    """output 里的目标路径：扩展名用真实格式，音频、同名 Premiere 工程和剪辑清单都不覆盖已有文件。
 
     同时预留文件名，避免排队中或进行中的任务写到同一个文件；任务结束时用 _release_out_path 释放。
     """
@@ -84,9 +84,8 @@ def _out_path(input_filename: str, user_outname: str, ext: str) -> str:
     candidate, i = stem, 0
     with _jobs_lock:
         while (candidate.lower() in _reserved_stems
-               or os.path.exists(os.path.join(OUT_DIR, candidate + ext))
-               or os.path.exists(os.path.join(OUT_DIR, candidate + ".prproj"))
-               or os.path.exists(os.path.join(OUT_DIR, candidate + ".xml"))):
+               or any(os.path.exists(os.path.join(OUT_DIR, candidate + suffix))
+                      for suffix in (ext, ".prproj", ".xml", "_cuts.txt"))):
             i += 1
             candidate = f"{stem}_{i}"
         _reserved_stems.add(candidate.lower())
@@ -307,7 +306,11 @@ def dedup():
         if local_path:
             audio_path = local_path
         else:
-            audio_path = os.path.join(job_dir, _safe_name(f.filename).lstrip(".") or "upload.bin")
+            # 单独放一个子目录：job_dir 里还会写名字固定的中间文件（review1.flac、words.json 等），
+            # 上传的文件和它们重名就会被覆盖
+            upload_dir = os.path.join(job_dir, "upload")
+            os.makedirs(upload_dir, exist_ok=True)
+            audio_path = os.path.join(upload_dir, _safe_name(f.filename).lstrip(".") or "upload.bin")
             f.save(audio_path)
         out_path = _out_path(audio_path, outname, output_extension(audio_path, out_format))
     except Exception:

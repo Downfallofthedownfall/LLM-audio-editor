@@ -28,13 +28,17 @@ os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-cache"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_HERE, ".hf-cache"))
 
 
-# 必然删除的无意义语气词（无歧义，直接删；其余交给 LLM 判断）
-CORE_FILLERS = {"um", "uh", "erm", "er", "em", "mm", "hmm", "ah", "oh", "uhh", "eh"}
+# 必然删除的无意义语气词（无歧义，直接删，复核时 LLM 也不能恢复；其余交给 LLM 判断）。
+# oh 不在这里：它也是数字 0 的读法（"two oh one"），按规则删错了没有人能恢复
+CORE_FILLERS = {"um", "uh", "erm", "er", "em", "mm", "hmm", "ah", "uhh", "eh"}
+# 语气词表里同时也是单位写法的词：前一个词带数字时（"35 mm"）它是单位，不按规则删
+_UNIT_FILLERS = {"mm"}
 # 中文口癖/感叹语气词。转写可能按单字切分，所以这里只放几乎不会构成其他词的字；
 # 哈（哈佛）、喂（喂养）、吓（吓人）、呵（呵护）、呐（呐喊）这类有歧义的字，
+# 粤语里表示「不」的 唔（唔好、唔係：删掉意思就反了），
 # 以及“那个/就是/然后”这类有语义的连接词，都交给 LLM 按上下文判断
 CORE_FILLERS_ZH = {
-    "嗯", "唔", "呃", "啊", "哦", "噢", "咦", "诶", "欸", "哎", "唉", "喔",
+    "嗯", "呃", "啊", "哦", "噢", "咦", "诶", "欸", "哎", "唉", "喔",
     "哎呀", "哎哟", "嗯嗯", "啊啊", "哦哦", "嘻嘻",
 }
 # 中文语言码识别
@@ -56,6 +60,16 @@ def _norm_language(language: str) -> str:
 def _is_bracket_sound(w: str) -> bool:
     """形如 [throatclearing]、[UM]、[cough]、【咳嗽】 之类的声音标记。"""
     return bool(re.match(r"^\s*(\[[^\]]+\]|【[^】]+】)", w))
+
+
+def _is_vocal_sound(word: str, prev_word: str, fillers: Set[str]) -> bool:
+    """这个词是不是必然删除的声音：括号声音标记，或语气词表（fillers）里的词。prev_word 是它前面那个词。"""
+    if _is_bracket_sound(word):
+        return True
+    key = _as_posix_clean(word)
+    if key not in fillers:
+        return False
+    return not (key in _UNIT_FILLERS and re.search(r"\d", prev_word))
 
 
 def _report(progress, frac: float, msg: str):
@@ -916,15 +930,20 @@ def _llm_option_ladder(mode: str) -> List[Dict]:
     return [options for t in tunings for options in ({**t, **fmt}, t)]
 
 
+# 参数里要求 JSON 模式的键（chat / responses 各一个）
+_LLM_FORMAT_KEYS = ("response_format", "text")
+
+
 class _LLMClient:
-    """OpenAI 兼容端点的客户端，记住第一组可用的 API 和参数，后续窗口不再重复试错。
+    """OpenAI 兼容端点的客户端，记住第一组可用的 API 和参数，后续窗口都用这一组，不再重复试错。
 
     api_mode：
       "chat"       -> 只用 chat.completions
       "responses"  -> 只用 Responses API
       "auto"       -> 先试 Responses API，端点不存在或拒绝请求时回退 chat.completions
 
-    提供方拒绝某个参数（如模型不支持 temperature 或 reasoning）时逐级去掉参数重试。
+    第一次请求（check）时，提供方拒绝某个参数（如模型不支持 temperature 或 reasoning）就逐级去掉参数重试，
+    找到可用的一组后固定下来（见 _attempts）。
     鉴权失败、限流、超时、断网时重试参数没有意义，直接抛出。
     """
 
@@ -943,14 +962,24 @@ class _LLMClient:
         resp = self._client.responses.create(model=self._model, input=messages, **options, **extra)
         return _resp_text(resp).strip()
 
+    def _attempts(self) -> List[Tuple[str, Dict]]:
+        """这次请求依次尝试的 (API 种类, 参数)。
+
+        还没有成功过：所有组合，由全到简。已经成功过：只用那一组，至多去掉 JSON 模式再试一次
+        （回复文本里也能解析出 JSON）。不再往下试别的组合：提供方偶发一次 400，就会让这一窗、
+        乃至后面所有窗口在不带思考的情况下判定，而且没有任何提示。宁可让这一窗失败重试，重试用尽就如实报告。
+        """
+        if not self._working:
+            return [(mode, opts) for mode in self._modes for opts in _llm_option_ladder(mode)]
+        mode, options = self._working
+        plain = {k: v for k, v in options.items() if k not in _LLM_FORMAT_KEYS}
+        return [(mode, options)] + ([(mode, plain)] if plain != options else [])
+
     def complete(self, messages: List[Dict], timeout=None) -> str:
         """返回助手回复的文本；所有组合都失败时抛 RuntimeError，说明最后一个错误。"""
-        attempts = [(mode, opts) for mode in self._modes for opts in _llm_option_ladder(mode)]
-        if self._working:
-            attempts.insert(0, self._working)
         last_error = "empty reply"
         no_endpoint = set()
-        for mode, options in attempts:
+        for mode, options in self._attempts():
             if mode in no_endpoint:
                 continue
             try:
@@ -965,7 +994,8 @@ class _LLMClient:
                     raise
                 continue
             if txt:
-                self._working = (mode, options)
+                if not self._working:
+                    self._working = (mode, options)
                 return txt
             last_error = "empty reply"  # JSON 模式下回复可能只剩空格，去掉参数再试
         raise RuntimeError(last_error)
@@ -1136,7 +1166,9 @@ def llm_review_cuts(words: List[Dict], llm: _LLMClient, proposed: Set[int], lock
         restorable = {i for i in proposed if a <= i < b and i not in locked}
         restore &= restorable
         delete = {i for i in delete if a <= i < b and i not in proposed}
-        _check_delete_ratio(sum(1 for i in proposed if a <= i < b) - len(restore) + len(delete), b - a)
+        # 只看这次回复自己补删了多少，和还留着的词比：之前各轮已经删掉的不算在它头上，
+        # 否则重说很多的段落（已删词本来就超过上限）无论回复什么都会被判成失败
+        _check_delete_ratio(len(delete), b - a - sum(1 for i in proposed if a <= i < b))
         if len(restorable) >= _LLM_RESTORE_GUARD_MIN and len(restore) > _LLM_MAX_RESTORE_RATIO * len(restorable):
             raise ValueError("the reply restored %d of %d cuts, which looks wrong, so it was not applied"
                              % (len(restore), len(restorable)))
@@ -1199,13 +1231,22 @@ def _env_frame(env: np.ndarray, t: float) -> int:
     return max(0, min(len(env), int(round(t * _ENV_RATE))))
 
 
-def _valleys(env: np.ndarray, lo: int, hi: int) -> List[Tuple[int, int]]:
-    """[lo, hi) 里所有够长的安静段。门限按前后 5 秒的音量定，适应不同音量和底噪。"""
+def _quiet_level(env: np.ndarray, lo: int, hi: int) -> Optional[float]:
+    """[lo, hi) 附近低于多少算安静。门限按前后 5 秒的音量定，适应不同音量和底噪；
+    响度几乎不变（持续噪声等）、分不出哪里是空隙时返回 None。"""
     around = env[max(0, lo - 1000):hi + 1000]
     floor, speech = np.percentile(around, 5), np.percentile(around, 95)
-    if speech - floor < _MIN_CONTRAST_DB:  # 响度几乎不变（持续噪声等），分不出哪里是空隙
+    if speech - floor < _MIN_CONTRAST_DB:
+        return None
+    return float(max(floor + 8, speech - 28))
+
+
+def _valleys(env: np.ndarray, lo: int, hi: int) -> List[Tuple[int, int]]:
+    """[lo, hi) 里所有够长的安静段。"""
+    level = _quiet_level(env, lo, hi)
+    if level is None:
         return []
-    quiet = env[lo:hi] <= max(floor + 8, speech - 28)
+    quiet = env[lo:hi] <= level
     edges = np.flatnonzero(np.diff(np.concatenate(([0], quiet.astype(np.int8), [0]))))
     shortest = int(_MIN_VALLEY_SEC * _ENV_RATE)
     return [(lo + a, lo + b) for a, b in zip(edges[::2], edges[1::2]) if b - a >= shortest]
@@ -1304,6 +1345,18 @@ def _gap_before(env: np.ndarray, t: float) -> float:
         return max(0.0, t - _CLIP_FALLBACK_SEC)
     a, b = valleys[-1]
     return float(max(b - _LEAD_SEC * _ENV_RATE, a) / _ENV_RATE)
+
+
+def _cut_in_sound(env: np.ndarray, t: float) -> bool:
+    """切点 t 是否落在声音里（它不在任何空隙里：两边的词连读，或者切点没能校准到空隙上）。
+    响度分不出空隙时返回 False：没有依据，就不当成落在声音里。"""
+    at = _env_frame(env, t)
+    reach = int(_VALLEY_REACH_SEC * _ENV_RATE)
+    lo, hi = max(0, at - reach), min(len(env), at + reach)
+    if hi <= lo or _quiet_level(env, lo, hi) is None:
+        return False
+    # 切点取整到毫秒再换算成帧，可能比空隙的边缘偏出一帧
+    return not any(a - 1 <= at <= b + 1 for a, b in _valleys(env, lo, hi))
 
 
 def _same_run(prev: Dict, cur: Dict, gap: float, keep_gap: float) -> bool:
@@ -1426,6 +1479,10 @@ _ALIGN_SLACK_SEC = 0.1     # 对齐时，听到的词可以比它那一块的范
 _LEAK_MAX_SEC = 1.0        # 接缝处漏进来的声音最长算这么多；更长的多半是第一次转写漏掉的一段话，交给 LLM 判断
 _CLIP_MIN_CHARS = 2        # 听到的残片至少这么长，才用来判断「词被切断」
 _UNHEARD_MIN_CHARS = 4     # 块边缘的词完全没听到时，这么长的词才算被切断：短的虚词常被转写漏掉，不代表没有声音
+# 中文按字切分，一个字是一个音节，相当于英文的两三个字母，所以两个门槛按字数减半。
+# 多数 token 只有一个字，按长度还是判不出来：这种字要切点落在声音里（_cut_in_sound）才算被切断
+_CLIP_MIN_CHARS_ZH = 1
+_UNHEARD_MIN_CHARS_ZH = 2
 REVIEW_PASSES = 2          # 默认听几遍：第一遍发现并修改，第二遍确认修改后的成片
 
 
@@ -1582,7 +1639,7 @@ def _merge_heard(tokens: List[Dict], word_block: Dict[int, int], heard: List[Dic
                     break
                 superseded[i] = j
         for j in js:
-            if _is_bracket_sound(heard[j]["word"]) or hkeys[j] in fillers:
+            if _is_vocal_sound(heard[j]["word"], heard[j - 1]["word"] if j else "", fillers):
                 new_cut[j] = "filler"
     found["leaks"] = sum(1 for reason in new_cut.values() if reason == "leak")
     found["fillers"] = sum(1 for reason in new_cut.values() if reason == "filler")
@@ -1624,6 +1681,9 @@ def _merge_heard(tokens: List[Dict], word_block: Dict[int, int], heard: List[Dic
     found["undone"] = len(given_back)
 
     # 块边缘的词被切断：只听到它的一头，或者整个词都没听到。同一侧只挪一次，挪过还听不到就不再动
+    zh = _norm_language(language) == "zh"
+    clip_min, unheard_min = (_CLIP_MIN_CHARS_ZH, _UNHEARD_MIN_CHARS_ZH) if zh else (_CLIP_MIN_CHARS, _UNHEARD_MIN_CHARS)
+
     def _clipped(i: int, at_end: bool) -> bool:
         if (i, 2 if at_end else 0) in given_back:
             return False
@@ -1631,12 +1691,19 @@ def _merge_heard(tokens: List[Dict], word_block: Dict[int, int], heard: List[Dic
             return False
         if i not in variants:
             # 没听到不一定是被切断（转写偶尔会漏词），挪错了要靠下一遍听出来，所以最后一遍不做
-            return not last_pass and len(keys[i]) >= _UNHEARD_MIN_CHARS
+            if last_pass:
+                return False
+            if len(keys[i]) >= unheard_min:
+                return True
+            # 中文的单个字按长度判不出来：切点在空隙里，声音是完整的，没听到只是转写漏了；
+            # 切点落在声音里、这个字又完全没听到，才是被切断了
+            s, e = timeline.blocks[word_block[i]]
+            return zh and _cut_in_sound(env, e if at_end else s)
         j = variants[i][-1 if at_end else 0]
         if j != heard_in[word_block[i]][-1 if at_end else 0]:
             return False  # 残片外侧还听到了别的词，词不是在切点上断的
         part, whole = hkeys[j], keys[i]
-        if not _CLIP_MIN_CHARS <= len(part) < len(whole):
+        if not clip_min <= len(part) < len(whole):
             return False
         if not at_end:
             return whole.endswith(part)
@@ -1870,7 +1937,7 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     # 无意义声音标记 + 纯语气词必然删，兜底 LLM 的漏判
     core = _core_fillers_for(language)
     auto: Set[int] = {i for i, w in enumerate(words)
-                      if _is_bracket_sound(w["word"]) or _as_posix_clean(w["word"]) in core}
+                      if _is_vocal_sound(w["word"], words[i - 1]["word"] if i else "", core)}
     _report(progress, 0.45, "LLM dedup: analyzing words window by window…")
     llm_indices, failures, total_windows = llm_dedup_words(words, llm, progress=progress, language=language)
     # 全部失败时成片只切了静音，没有意义，不要当成结果交付
