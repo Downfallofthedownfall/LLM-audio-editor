@@ -2,6 +2,7 @@
 音频自动去重/去空 Web 界面（Flask + SSE 实时进度）
 - 定位说话内容并拼接：只保留说话片段，切掉空隙，保持原始采样率/声道
 - LLM(OpenAI 兼容, 任意 chat.completions / responses 端点) 智能判重
+- 听成片复核：把剪好的结果重新转写，修掉接缝处的残音和被切断的词
 - 输出音频（wav / flac / mp3）和视频、音频都剪好的 Premiere 工程
 """
 import os, uuid, json, time, re, threading, traceback, shutil, tempfile, glob, socket
@@ -19,7 +20,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-cache"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_HERE, ".hf-cache"))
 
-from dedup import dedup_audio, new_job_dir, output_extension, WORK_DIR
+from dedup import dedup_audio, new_job_dir, output_extension, WORK_DIR, REVIEW_PASSES
 
 app = Flask(__name__)
 HOST, PORT = "127.0.0.1", 7861
@@ -130,7 +131,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .row{display:flex;gap:12px} .row>div{flex:1}
 </style></head><body>
 <h1>🎙️ Speech Extraction + Dedup</h1>
-<p class="muted">Removes silences, mis-speaks and restarts, then gives you clean audio plus a Premiere project with the video and audio cut. Premiere opens briefly at the end of a run, so close it first. Your input file is never modified.</p>
+<p class="muted">Removes silences, mis-speaks and restarts, listens to the result again to fix what only shows up in the audio, then gives you clean audio plus a Premiere project with the video and audio cut. Premiere opens briefly at the end of a run, so close it first. Your input file is never modified.</p>
 
 <div id="formwrap">
 <form id="f">
@@ -154,6 +155,11 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    </div>
    <div><label>Silence gap (seconds, larger = keep more pauses, cut less)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
  </div>
+ <label>ASR review: listen to the edit again (each pass transcribes the whole edit once more)</label><select name="review_passes">
+   <option value="2" selected>2 passes (default: the second pass checks the fixes of the first)</option>
+   <option value="1">1 pass (faster: its fixes are not listened to again)</option>
+   <option value="3">3 passes (slowest)</option>
+ </select>
  <div class="row">
    <div><label>Output format</label><select name="out_format"><option value="flac" selected>FLAC (lossless)</option><option value="wav">WAV (lossless)</option><option value="auto">Match source (re-encodes if the source is lossy)</option><option value="mp3">MP3</option></select></div>
    <div><label>MP3 bitrate</label><select name="out_bitrate"><option value="192k">192k</option><option value="320k" selected>320k</option><option value="128k">128k</option></select></div>
@@ -209,6 +215,12 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
           p.textContent = '🎬 Premiere project: ' + m.out_project;
           el('res').append(p);
         }
+        if (m.review) {
+          const p = document.createElement('p');
+          p.className = 'muted';
+          p.textContent = '🎧 ' + m.review;
+          el('res').append(p);
+        }
         if (m.out_cuts) {
           const p = document.createElement('p'), a = document.createElement('a');
           a.href = '/output/' + encodeURIComponent(m.out_cuts);
@@ -231,7 +243,7 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
   } catch(e){ showErr('Request failed: '+e); }
 });
 // 记住上次的设置，不用每次重填。API key 和文件路径不存
-const SAVED_FIELDS = ['api_url','model','api_mode','language','whisper','keep_gap','out_format','out_bitrate'];
+const SAVED_FIELDS = ['api_url','model','api_mode','language','whisper','keep_gap','review_passes','out_format','out_bitrate'];
 const form = document.getElementById('f');
 const saved = JSON.parse(localStorage.getItem('settings') || '{}');
 for (const k of SAVED_FIELDS) { if (saved[k]) form.elements[k].value = saved[k]; }
@@ -277,6 +289,12 @@ def dedup():
     if language not in ("en", "zh"):
         language = "en"
     outname = request.form.get("outname", "")
+    try:
+        review_passes = int(request.form.get("review_passes") or REVIEW_PASSES)
+    except ValueError:
+        review_passes = REVIEW_PASSES
+    if review_passes not in (1, 2, 3):
+        review_passes = REVIEW_PASSES
 
     if api_mode not in ("auto", "chat", "responses"):
         api_mode = "auto"
@@ -301,7 +319,7 @@ def dedup():
     with _jobs_lock:
         _jobs[job_id] = {"progress": 0.0, "msg": "Queued…", "done": False, "error": None,
                          "kept_sec": 0.0, "removed_sec": 0.0, "total_sec": 0.0, "outname": out_url,
-                         "out_project": None, "out_cuts": None, "warnings": []}
+                         "out_project": None, "out_cuts": None, "review": "", "warnings": []}
 
     def _progress(frac, msg):
         with _jobs_lock:
@@ -314,7 +332,7 @@ def dedup():
                 info = dedup_audio(audio_path, out_path, api_url=api_url, model=model, api_key=api_key,
                                    whisper_model=whisper, language=language, keep_gap=keep_gap,
                                    api_mode=api_mode, out_format=out_format, out_bitrate=out_bitrate,
-                                   progress=_progress, work_dir=job_dir)
+                                   review_passes=review_passes, progress=_progress, work_dir=job_dir)
             with _jobs_lock:
                 j = _jobs[job_id]
                 j["kept_sec"] = info["kept_sec"]
@@ -324,6 +342,7 @@ def dedup():
                 j["progress"] = 1.0
                 j["out_project"] = info.get("out_project")
                 j["out_cuts"] = os.path.basename(info["out_cuts"]) if info.get("out_cuts") else None
+                j["review"] = info.get("review", "")
                 j["warnings"] = info.get("warnings", [])
                 j["done"] = True
         except Exception as e:
