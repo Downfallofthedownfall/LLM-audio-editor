@@ -20,7 +20,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-cache"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_HERE, ".hf-cache"))
 
-from dedup import dedup_audio, new_job_dir, output_extension, WORK_DIR, REVIEW_PASSES
+from dedup import dedup_audio, new_job_dir, output_extension, WORK_DIR, REVIEW_PASSES, TAKE_MODES
 
 app = Flask(__name__)
 HOST, PORT = "127.0.0.1", 7861
@@ -154,6 +154,11 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    </div>
    <div><label>Silence gap (seconds, larger = keep more pauses, cut less)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
  </div>
+ <label>Line check: off-script remarks and earlier takes of something said again later</label><select name="take_mode">
+   <option value="cut" selected>Cut them when two readings agree, mark the rest to check (default)</option>
+   <option value="mark">Only mark them, cut nothing</option>
+   <option value="off">Off (only remove mis-speaks)</option>
+ </select>
  <label>ASR review: listen to the edit again (each pass transcribes the whole edit once more)</label><select name="review_passes">
    <option value="2" selected>2 passes (default: the second pass checks the fixes of the first)</option>
    <option value="1">1 pass (faster: its fixes are not listened to again)</option>
@@ -214,10 +219,11 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
           p.textContent = '🎬 Premiere project: ' + m.out_project;
           el('res').append(p);
         }
-        if (m.review) {
+        for (const [icon, text] of [['✂️ ', m.lines], ['🎧 ', m.review]]) {
+          if (!text) continue;
           const p = document.createElement('p');
           p.className = 'muted';
-          p.textContent = '🎧 ' + m.review;
+          p.textContent = icon + text;
           el('res').append(p);
         }
         if (m.out_cuts) {
@@ -242,7 +248,7 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
   } catch(e){ showErr('Request failed: '+e); }
 });
 // 记住上次的设置，不用每次重填。API key 和文件路径不存
-const SAVED_FIELDS = ['api_url','model','api_mode','language','whisper','keep_gap','review_passes','out_format','out_bitrate'];
+const SAVED_FIELDS = ['api_url','model','api_mode','language','whisper','keep_gap','take_mode','review_passes','out_format','out_bitrate'];
 const form = document.getElementById('f');
 const saved = JSON.parse(localStorage.getItem('settings') || '{}');
 for (const k of SAVED_FIELDS) { if (saved[k]) form.elements[k].value = saved[k]; }
@@ -294,6 +300,9 @@ def dedup():
         review_passes = REVIEW_PASSES
     if review_passes not in (1, 2, 3):
         review_passes = REVIEW_PASSES
+    take_mode = request.form.get("take_mode", "cut")
+    if take_mode not in TAKE_MODES:
+        take_mode = "cut"
 
     if api_mode not in ("auto", "chat", "responses"):
         api_mode = "auto"
@@ -322,7 +331,7 @@ def dedup():
     with _jobs_lock:
         _jobs[job_id] = {"progress": 0.0, "msg": "Queued…", "done": False, "error": None,
                          "kept_sec": 0.0, "removed_sec": 0.0, "total_sec": 0.0, "outname": out_url,
-                         "out_project": None, "out_cuts": None, "review": "", "warnings": []}
+                         "out_project": None, "out_cuts": None, "lines": "", "review": "", "warnings": []}
 
     def _progress(frac, msg):
         with _jobs_lock:
@@ -335,7 +344,8 @@ def dedup():
                 info = dedup_audio(audio_path, out_path, api_url=api_url, model=model, api_key=api_key,
                                    whisper_model=whisper, language=language, keep_gap=keep_gap,
                                    api_mode=api_mode, out_format=out_format, out_bitrate=out_bitrate,
-                                   review_passes=review_passes, progress=_progress, work_dir=job_dir)
+                                   review_passes=review_passes, take_mode=take_mode, progress=_progress,
+                                   work_dir=job_dir)
             with _jobs_lock:
                 j = _jobs[job_id]
                 j["kept_sec"] = info["kept_sec"]
@@ -345,6 +355,7 @@ def dedup():
                 j["progress"] = 1.0
                 j["out_project"] = info.get("out_project")
                 j["out_cuts"] = os.path.basename(info["out_cuts"]) if info.get("out_cuts") else None
+                j["lines"] = info.get("lines", "")
                 j["review"] = info.get("review", "")
                 j["warnings"] = info.get("warnings", [])
                 j["done"] = True

@@ -3,10 +3,13 @@
   1) CrisperWhisper 逐字转写（在独立解释器中运行，带词级时间戳）
   2) 规则清理：括号声音标记、无歧义语气词（精确、无需模型）
   3) LLM（OpenAI 兼容，chat.completions / responses 端点）逐词判定口误，返回要删除的词索引
-  4) 听成片复核：把剪好的结果拼出来重新逐字转写，和计划保留的词对齐，修掉只有听才能发现的问题
+  4) 按句判定：LLM 通读删掉口误之后剩下的内容，找出整句该剪的行（画外话、后面又重说了一遍的前一版）。
+     读两遍，都认定的才剪，其余的留在成片里并做上标记，交给人工确认
+  5) 听成片复核：把剪好的结果拼出来重新逐字转写，和计划保留的词对齐，修掉只有听才能发现的问题
      （被删词漏进来的残音、被切断的词、第一次转写漏掉的口误），再由 LLM 读实际听到的内容，恢复误删、补删漏删
-  5) ffmpeg 流式解码 → 只保留选中区间 → 流式编码，内存占用与时长无关
-  6) 输出视频和音频都剪好的 Premiere 工程（见 premiere.py），以及可通读的剪辑清单
+  6) ffmpeg 流式解码 → 只保留选中区间 → 流式编码，内存占用与时长无关
+  7) 输出视频和音频都剪好的 Premiere 工程（见 premiere.py）、可通读的剪辑清单，以及逐词的判定记录
+     （.work\\edits，供 evaluate.py 和人工修正后的工程对照）
 """
 import bisect, collections, datetime, difflib, hashlib, itertools, json, os, re, shutil, subprocess, sys, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -84,6 +87,10 @@ def _report(progress, frac: float, msg: str):
 WORK_DIR = os.path.join(_HERE, ".work")
 # 转写结果跨任务保留（不在 job 目录里）：转写最慢，同一文件重跑时不用再等
 TRANSCRIPT_DIR = os.path.join(WORK_DIR, "transcripts")
+# 每次任务的逐词判定记录，按输出文件名存放：evaluate.py 用它和人工修正后的 Premiere 工程对照
+EDIT_DIR = os.path.join(WORK_DIR, "edits")
+# LLM 回复按请求内容存放：同一个文件重跑时判定不变，改了后面的步骤才看得出是哪一步造成的差别
+LLM_CACHE_DIR = os.path.join(WORK_DIR, "llm_cache")
 _LOG_FILE = os.path.join(WORK_DIR, "debug.log")
 _dbg_lock = threading.Lock()
 # 管道每次读写的大小：拼接时的内存占用由它决定，与音频时长无关
@@ -456,8 +463,10 @@ def _splice_spans_ms(keep_blocks: List[Tuple[float, float]], total_dur: float) -
     spans: List[Tuple[int, int]] = []
     pos = 0
     for s, e in sorted(keep_blocks):
-        s_ms = max(pos, int(max(0.0, min(float(s), total_dur)) * 1000))
-        e_ms = int(max(0.0, min(float(e), total_dur)) * 1000)
+        # 四舍五入而不是截断：128.29 秒乘 1000 得 128289.99…，截断会少 1 毫秒，
+        # 听过的切点原样用到下一遍时，每一遍都会再挪 1 毫秒
+        s_ms = max(pos, int(round(max(0.0, min(float(s), total_dur)) * 1000)))
+        e_ms = int(round(max(0.0, min(float(e), total_dur)) * 1000))
         if e_ms - s_ms > 40:
             spans.append((s_ms, e_ms))
             pos = e_ms
@@ -700,7 +709,10 @@ REVIEW_RULES = (
     "The words marked DEL were cut out and are not heard. "
     "A word marked LEFTOVER ([~like this~] in the header) was heard right at a cut although it was not in the plan: "
     "usually it is a fragment of the cut-out words that leaked through, so it is being trimmed and will not be heard "
-    "either.\n\n"
+    "either. "
+    "A word marked OFF ([=like this=] in the header) belongs to a whole line that was cut on purpose, because the "
+    "speaker was off-script (talking to themselves, a remark about the recording) or said the same thing again later. "
+    "Those cuts are final: never list them.\n\n"
     "Read the text the way a listener will hear it, with the deleted words gone, and look for two kinds of error:\n"
     "RESTORE — a word was wrongly deleted:\n"
     "  * Without it the remaining text loses information or is no longer grammatical.\n"
@@ -738,7 +750,9 @@ REVIEW_RULES_ZH = (
     "标题下面每个词/字单独一行，格式为『GLOBAL_INDEX  词』，被删除的格式为『GLOBAL_INDEX  DEL  词』。"
     "没有标记的词就是听众在成片里听到的内容，其中包括第一次转写漏掉的词。标了 DEL 的词已被剪掉，听不到。"
     "标了 LEFTOVER 的词（标题行里写成 [~这样~]）是在剪切处听到、但不在计划里的声音："
-    "它通常是被删词漏进来的残音，所以正在被修掉，同样听不到。\n\n"
+    "它通常是被删词漏进来的残音，所以正在被修掉，同样听不到。"
+    "标了 OFF 的词（标题行里写成 [=这样=]）属于被整行剪掉的内容：说话人在说画外话（自言自语、关于录制本身的话），"
+    "或者后面又把同样的内容说了一遍。这些删除是有意的、已经定下来的，不要列出。\n\n"
     "请按听众听到的内容阅读（被删的词已经不存在），查找两类错误：\n"
     "RESTORE（恢复）——词被误删：\n"
     "  * 删掉后，剩下的内容丢失了信息，或者句子不通。\n"
@@ -760,6 +774,89 @@ REVIEW_SYSTEM_ZH = (
     "你是一名细致的音频剪辑复核员。你对照成片的转写检查另一位编辑的删除，只纠正明显的错误。"
     "请花足够的时间，按听众听到的内容通读结果。"
     "最终回答只能是一个紧凑的 JSON 对象 {\"restore\":[...],\"delete\":[...]}，不要解释，不要引用或复述转写。"
+)
+
+
+# 按句判定：第一轮逐词判定只认「同一句话说了两遍」，认不出画外话和换了说法的重说。对照人工修正过的工程实测：
+# 第一轮删的词几乎全对，但该删的只找到约六成，漏掉的九成是整句的画外话和整句重说（见 evaluate.py）。
+# 所以这一轮换成编辑的角度：读删掉口误之后剩下的内容，一行一行判断它该不该出现在成片里
+TAKE_RULES = (
+    "You are editing the narration of a recorded video. The recording is raw: besides the narration it contains "
+    "things the speaker never meant the audience to hear. Stutters, false starts and filler sounds have already been "
+    "removed. What is left is shown below in the order it was spoken, one numbered line (L0, L1, ...) per sentence or "
+    "phrase. A note such as '(after a 12 s pause)' means the speaker was silent for that long before the line.\n\n"
+    "Find the lines that must be cut from the finished video. There are two kinds.\n\n"
+    "OFF-SCRIPT — the speaker is not narrating to the audience:\n"
+    "  * Talking to themselves, or reacting to something that went wrong while recording ('Oh god, wrong button.', "
+    "'Why is it so laggy?', 'Nope.', 'Hang on a minute.', 'What am I doing?').\n"
+    "  * Remarks about the recording, or notes to themselves or to the editor ('I'll record the voice for this later.', "
+    "'Let me try that again.', 'Stop there.', 'Put this earlier.', 'What else is on the list?', 'Is it outro time?').\n"
+    "  * Apologies and comments on their own performance ('Sorry, I keep stumbling over my words today.').\n"
+    "  * Warm-up talk before the narration begins, and chatter after it ends.\n\n"
+    "EARLIER TAKE — the speaker says something and later says it again, usually after a pause, a mistake or an "
+    "off-script remark. The wording can be quite different: what matters is that the later line delivers the same "
+    "point, so a viewer who hears both hears it twice. Cut the EARLIER take and keep the LAST one. A take can span "
+    "several lines: list every line of the earlier take. A line that starts a thought and drops it is also an "
+    "earlier take when a later line starts that thought again.\n\n"
+    "KEEP:\n"
+    "  * Narration that is said once, however short or casual ('Okay.', 'Let's have a look.', 'And there we go.'). "
+    "A conversational tone is not off-script when the speaker is talking to the viewer.\n"
+    "  * Reactions that are part of the video: the narration carries on from them as if the viewer heard them.\n"
+    "  * Lines that come back to a topic to ADD something: a summary, another example, the same step for a different "
+    "thing. A line is an earlier take only when a later line makes it redundant.\n"
+    "  * The LAST take of anything, even when it is not perfect.\n\n"
+    "Only cut a line when you are confident. If you suspect a line but are not sure, put its number in 'unsure' "
+    "instead: it stays in the video and is marked for a human editor to check. Most lines are narration and stay.\n"
+    "Return ONLY a JSON object, e.g. {\"off_script\":[14,15],\"earlier_take\":[[31,34],[32,34]],\"unsure\":[40]}: "
+    "'off_script' lists line numbers, 'earlier_take' lists pairs [line to cut, later line that replaces it], and "
+    "'unsure' lists line numbers. If nothing needs to be cut, return "
+    "{\"off_script\":[],\"earlier_take\":[],\"unsure\":[]}. JSON only — no explanation."
+)
+
+TAKE_SYSTEM = (
+    "You are an experienced video editor preparing a raw voice recording for publication. You read the transcript "
+    "line by line and decide which whole lines do not belong in the finished video: off-script remarks, and earlier "
+    "takes of something the speaker says again later. Take the time you need to compare each line with the lines "
+    "after it. Your final answer must be only a compact JSON object "
+    "{\"off_script\":[...],\"earlier_take\":[[...]],\"unsure\":[...]}, with no explanation and without quoting the "
+    "transcript."
+)
+
+TAKE_RULES_ZH = (
+    "你正在剪辑一段视频的口播旁白。录音是原始素材：除了旁白，里面还有说话人并不想让观众听到的内容。"
+    "口吃、说错重来的半句和语气词已经删掉了。剩下的内容按说话顺序列在下面，每句话或每个短语一行，带编号（L0, L1, ...）。"
+    "行前的『（停顿 12 秒后）』表示说这一行之前，说话人沉默了这么久。\n\n"
+    "请找出成片里必须剪掉的行。有两类。\n\n"
+    "画外话（off_script）——说话人不是在对观众讲解：\n"
+    "  * 自言自语，或者对录制中出的状况做出的反应（『哎呀按错了。』『怎么这么卡？』『不对。』『等一下。』『我在干嘛？』）。\n"
+    "  * 关于录制本身的话，或者给自己、给剪辑师的备注（『这段配音我后面再录。』『我重来一遍。』『停在这。』『这段放前面。』"
+    "『清单上还有什么？』『该说结尾了吗？』）。\n"
+    "  * 道歉，或者评价自己的发挥（『不好意思，今天老是嘴瓢。』）。\n"
+    "  * 旁白开始之前的热身闲话，旁白结束之后的闲聊。\n\n"
+    "前一版（earlier_take）——说话人说了一段内容，后面又说了一遍，中间通常隔着停顿、口误或画外话。"
+    "两遍的措辞可能差别很大：关键是后面那一行讲的是同一个意思，两行都留着，观众就会听到两遍。"
+    "剪掉前面的版本，保留最后一版。一版可能占好几行：把前一版的每一行都列出来。"
+    "一行话开了个头就放弃了，后面又有一行重新开这个头，前面那行也算前一版。\n\n"
+    "保留：\n"
+    "  * 只说了一遍的旁白，不管多短、多随意（『好。』『我们来看一下。』『这样就行了。』）。"
+    "说话人是在对观众说话时，口语化的语气不算画外话。\n"
+    "  * 属于视频内容的反应：后面的旁白接着它往下讲，就像观众听到了它一样。\n"
+    "  * 回到同一个话题、但补充了新内容的行：总结、另一个例子、对另一个对象做同样的步骤。"
+    "只有后面的行让它变得多余时，它才是前一版。\n"
+    "  * 任何内容的最后一版，即使它并不完美。\n\n"
+    "有把握才剪。怀疑某一行该剪但拿不准，就把行号放进 unsure：这一行会留在成片里，并做上标记交给人工确认。"
+    "大多数行是旁白，应当保留。\n"
+    "只返回一个 JSON 对象，例如 {\"off_script\":[14,15],\"earlier_take\":[[31,34],[32,34]],\"unsure\":[40]}："
+    "off_script 列出行号，earlier_take 列出 [要剪掉的行, 取代它的后面那一行] 这样的数对，unsure 列出拿不准的行号。"
+    "没有要剪的就返回 {\"off_script\":[],\"earlier_take\":[],\"unsure\":[]}。只输出 JSON，不要解释。"
+)
+
+TAKE_SYSTEM_ZH = (
+    "你是一名经验丰富的视频剪辑师，正在把一段原始口播录音整理成可以发布的成片。"
+    "你逐行阅读转写，判断哪些整行不该出现在成片里：画外话，以及后面又重说了一遍的前一版。"
+    "做判断前请花足够的时间，把每一行和它后面的行对照。"
+    "最终回答只能是一个紧凑的 JSON 对象 {\"off_script\":[...],\"earlier_take\":[[...]],\"unsure\":[...]}，"
+    "不要解释，不要引用或复述转写。"
 )
 
 
@@ -787,12 +884,36 @@ def _review_prompts(language: str):
     return (REVIEW_RULES_ZH, REVIEW_SYSTEM_ZH) if _norm_language(language) == "zh" else (REVIEW_RULES, REVIEW_SYSTEM)
 
 
+# 按句判定的三段标记。后文上下文里的行可以是「取代前一版的后一行」，但它自己该不该剪由别的窗口判定
+_LINE_WINDOW_NOTES = {
+    "en": ("=== CONTEXT BEFORE (read only: judged in another window; do not cut these lines) ===",
+           "=== LINES TO JUDGE (only cut lines from this section) ===",
+           "=== CONTEXT AFTER (read only: shows whether a line above is said again, and a line here can be the later "
+           "line of a pair; do not cut these lines) ==="),
+    "zh": ("=== 前文上下文（只读：已在其他窗口判定；不要剪这里的行）===",
+           "=== 待判定的行（只剪这一段里的行）===",
+           "=== 后文上下文（只读：用来判断上面的行后面是否又说了一遍，这里的行可以作为数对里取代前一版的后一行；"
+           "不要剪这里的行）==="),
+}
+
+
+def _take_prompts(language: str):
+    """按语言返回 (规则, 系统提示) 两段按句判定 prompt。"""
+    return (TAKE_RULES_ZH, TAKE_SYSTEM_ZH) if _norm_language(language) == "zh" else (TAKE_RULES, TAKE_SYSTEM)
+
+
+# 句末标点：转写在这些标点后面断句
+_SENTENCE_END = (".", "!", "?", "…", "。", "！", "？")
+# 被按句判定整行剪掉的词，cut 记成这两个值之一：画外话 / 后面又说了一遍的前一版
+_TAKE_CUTS = ("off", "retake")
+
+
 def _utterances(words: List[Dict], a: int, b: int) -> List[List[int]]:
     """把 words[a:b] 按句子分组，返回每句的全局词索引。过长的句子按逗号/长度再拆，让重复短语更显眼。"""
     blocks, cur = [], []
     for i in range(a, b):
         cur.append(i)
-        if words[i]["word"].rstrip().endswith((".", "!", "?", "…", "。", "！", "？")):
+        if words[i]["word"].rstrip().endswith(_SENTENCE_END):
             blocks.append(cur); cur = []
     if cur:
         blocks.append(cur)
@@ -829,15 +950,18 @@ def _win_lines(words: List[Dict], a: int, b: int, sep: str = " ", proposed: Set[
 
     proposed 是复核时已经删除的词：标题行里标成 [-这样-]，词行里标 DEL。其中听成片时在剪切处多听到的声音
     （cut 为 "leak"）标成 [~这样~] 和 LEFTOVER：它们多半是被删词的残音，但也可能是第一次转写漏掉的词，要让 LLM 看得出区别。
+    按句判定整行剪掉的词（cut 为 _TAKE_CUTS 之一）标成 [=这样=] 和 OFF：它们不是口误，复核不能恢复，也要看得出区别。
     """
     def _flag(i: int) -> Optional[str]:
         if i not in proposed:
             return None
-        return "LEFTOVER" if words[i].get("cut") == "leak" else "DEL"
+        cut = words[i].get("cut")
+        return "LEFTOVER" if cut == "leak" else "OFF" if cut in _TAKE_CUTS else "DEL"
 
+    marks = {"DEL": "[-%s-]", "LEFTOVER": "[~%s~]", "OFF": "[=%s=]", None: None}
     lines = []
     for bi, idxs in enumerate(_utterances(words, a, b), 1):
-        text = _marked_text(words, idxs, sep, lambda i: {"DEL": "[-%s-]", "LEFTOVER": "[~%s~]", None: None}[_flag(i)])
+        text = _marked_text(words, idxs, sep, lambda i: marks[_flag(i)])
         lines.append("[U%d  %.2f-%.2fs]  %s" % (bi, words[idxs[0]]["start"], words[idxs[-1]]["end"], text))
         lines.extend("  %d  %s%s" % (i, _flag(i) + "  " if _flag(i) else "", words[i]["word"]) for i in idxs)
     return lines
@@ -905,6 +1029,28 @@ def _parse_review(content: str) -> Tuple[Set[int], Set[int]]:
     return set(_index_list(parsed.get("restore", []))), set(_index_list(parsed.get("delete", [])))
 
 
+def _parse_takes(content: str) -> Tuple[Set[int], List[Tuple[int, int]], Set[int]]:
+    """从按句判定的回复里解析 (画外话的行号, [(前一版的行, 取代它的后一行)], 拿不准的行号)。
+
+    前一版必须说出是哪一行取代了它：只给了行号、没给后一行的，没有依据核对，算作拿不准。
+    """
+    parsed = json.loads(_strip_json_fences(content, "off_script"))
+    if not (isinstance(parsed, dict) and {"off_script", "earlier_take"} & parsed.keys()):
+        raise ValueError("unexpected reply shape: %r" % content[:100])
+    takes = parsed.get("earlier_take", [])
+    if not isinstance(takes, list):
+        raise ValueError("unexpected reply shape: %r" % str(takes)[:100])
+    pairs: List[Tuple[int, int]] = []
+    unsure = set(_index_list(parsed.get("unsure", [])))
+    for item in takes:
+        numbers = _index_list(item if isinstance(item, list) else [item])
+        if len(numbers) == 2:
+            pairs.append((numbers[0], numbers[1]))
+        else:
+            unsure.update(numbers[:1])
+    return set(_index_list(parsed.get("off_script", []))), pairs, unsure
+
+
 # 思考强度。DeepSeek V4 系列可选 none（关闭）/ low / high / max，不传时默认开启且为 high。
 # 关思考(none)会导致模型逐个词乱删（碎片化、choppy）；实际使用中 high 的结果也比 max 好，所以不用 max
 REASONING_EFFORT = "high"
@@ -950,6 +1096,7 @@ class _LLMClient:
     def __init__(self, api_url: str, model: str, api_key: str, api_mode: str = "auto", timeout: int = 600):
         from openai import OpenAI
         self._client = OpenAI(base_url=api_url, api_key=api_key, timeout=timeout, max_retries=1)
+        self._endpoint = api_url
         self._model = model
         self._modes = {"chat": ["chat"], "responses": ["responses"]}.get(api_mode, ["responses", "chat"])
         self._working = None  # 第一组成功的 (mode, options)
@@ -1005,9 +1152,50 @@ class _LLMClient:
         """第一组成功的 (API 种类, 参数)。"""
         return self._working
 
+    @property
+    def cache_id(self) -> str:
+        """区分回复来源的标识：接口地址、模型和参数任何一个变了，存下的回复都不再适用。"""
+        return json.dumps([self._endpoint, self._model, self._working], sort_keys=True)
+
     def check(self) -> None:
         """发一个极小的请求确认 URL、密钥和模型名可用。"""
         self.complete([{"role": "user", "content": 'Reply with the JSON object {"ok": true}.'}], timeout=120)
+
+
+def _ask(llm, messages: List[Dict], parse, label: str, ask: int = 0):
+    """问 LLM 并用 parse 解析回复，返回解析结果；parse 不接受回复时抛出它的异常（调用方据此重试）。
+
+    解析通过的回复按请求内容存盘（LLM_CACHE_DIR），同样的请求下次直接用存下的回复：同一个文件重跑时判定不变，
+    改了后面的步骤才看得出差别是哪一步造成的。请求内容（提示词、转写、判定范围）或 llm.cache_id 变了就不会命中。
+    没通过解析的回复不存，所以一次坏的回复不会被记住。llm 没有 cache_id（测试用的替身）时不存不取。
+    ask 区分「同一个请求有意问的第几次」：各次的回复分开存，重跑时每一次用的还是它自己那一份。
+    """
+    path = None
+    cache_id = getattr(llm, "cache_id", None)
+    if cache_id:
+        key = hashlib.sha256(json.dumps([cache_id, ask, messages], sort_keys=True).encode("utf-8")).hexdigest()
+        path = os.path.join(LLM_CACHE_DIR, key[:2], key + ".json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = json.load(f)["reply"]
+            result = parse(content)
+            _dbg("%s reply taken from %s (%d chars): %s" % (label, path, len(content), content[:3000]))
+            return result
+        except Exception:  # 没存过，或者存下的回复按现在的规则通不过：重新问
+            pass
+    content = llm.complete(messages)
+    _dbg("%s reply (%d chars): %s" % (label, len(content), content[:3000]))
+    result = parse(content)
+    if path:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            part = "%s.%d.part" % (path, threading.get_ident())  # 两个线程可能同时存同一个请求的回复
+            with open(part, "w", encoding="utf-8") as f:
+                json.dump({"reply": content, "saved": datetime.datetime.now().isoformat(timespec="seconds")}, f)
+            os.replace(part, path)
+        except OSError as e:
+            _dbg("[warn] could not save the LLM reply: %r" % str(e)[:200])
+    return result
 
 
 # 窗口小一些，模型对每个词的注意力更集中；上下文约一分钟，隔得较远的重说也看得到
@@ -1061,9 +1249,14 @@ def _check_delete_ratio(deleted: int, judged: int) -> None:
         raise ValueError("the reply deleted %d of %d words, which looks wrong, so it was not applied" % (deleted, judged))
 
 
-def _run_windows(words: List[Dict], windows: List[Tuple[int, int, int, int]], judge, progress,
+def _time_range(words: List[Dict], first: int, last: int) -> str:
+    """words[first] 到 words[last] 在素材里的时间范围，用来告诉用户哪一段没处理好。"""
+    return "%s-%s" % (_timecode(words[first]["start"]), _timecode(words[last]["end"]))
+
+
+def _run_windows(windows: List[Tuple], judge, where, progress,
                  span: Tuple[float, float], label: str) -> Tuple[Dict, List[Tuple[str, str]]]:
-    """并行跑各窗，返回 ({窗口: judge 的结果}, 失败窗口的 (时间范围, 错误))。
+    """并行跑各窗，返回 ({窗口: judge 的结果}, 失败窗口的 (时间范围, 错误))。where(窗口) 给出它的时间范围。
 
     窗口可以乱序完成：judge 只读同一份输入，只产出自己判定范围内的结果，窗口之间没有依赖，所以完成顺序不影响最终结果。
     失败的窗口等其他窗口跑完后降低并发重试，重试用尽才算失败。
@@ -1075,7 +1268,7 @@ def _run_windows(words: List[Dict], windows: List[Tuple[int, int, int, int]], ju
         try:
             return win, judge(win), None
         except Exception as e:
-            _dbg("[warn] %s window %d-%d failed: %r" % (label, win[1], win[2], str(e)[:300]))
+            _dbg("[warn] %s window %s failed: %r" % (label, where(win), str(e)[:300]))
             return win, None, e
 
     results: Dict = {}
@@ -1097,8 +1290,7 @@ def _run_windows(words: List[Dict], windows: List[Tuple[int, int, int, int]], ju
                 if error is None:
                     results[win] = got
                 else:
-                    where = "%s-%s" % (_timecode(words[win[1]]["start"]), _timecode(words[win[2] - 1]["end"]))
-                    failures.append((where, str(error)[:200]))
+                    failures.append((where(win), str(error)[:200]))
                 done += 1
                 _report(progress, lo + (hi - lo) * done / total, "%s %d/%d windows…" % (label, done, total))
         pending = retry
@@ -1108,8 +1300,8 @@ def _run_windows(words: List[Dict], windows: List[Tuple[int, int, int, int]], ju
     return results, failures
 
 
-def llm_dedup_words(words: List[Dict], llm: _LLMClient, progress=None,
-                    language: str = "en") -> Tuple[List[int], List[Tuple[str, str]], int]:
+def llm_dedup_words(words: List[Dict], llm: _LLMClient, progress=None, language: str = "en",
+                    span: Tuple[float, float] = (0.45, 0.51)) -> Tuple[List[int], List[Tuple[str, str]], int]:
     """第一轮：用 LLM 分窗判定口误，返回 (要删除的全局词索引, 失败窗口的 (时间范围, 错误), 窗口总数)。
 
     每窗判定 _LLM_WINDOW_WORDS 个词，前后各带 _LLM_CONTEXT_WORDS 个词的只读上下文。
@@ -1126,15 +1318,19 @@ def llm_dedup_words(words: List[Dict], llm: _LLMClient, progress=None,
         _, a, b, _ = win
         user_prompt = _window_prompt(words, win, rules, "Return ONLY a JSON object {\"indices\":[...]} listing the "
                                      "GLOBAL index numbers to DELETE.", language)
-        content = llm.complete([{"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt}])
-        _dbg("window %d-%d reply (%d chars): %s" % (a, b, len(content), content[:3000]))
-        got = {i for i in _parse_indices(content) if a <= i < b}
-        _check_delete_ratio(len(got), b - a)
+
+        def _parse(content: str) -> Set[int]:
+            got = {i for i in _parse_indices(content) if a <= i < b}
+            _check_delete_ratio(len(got), b - a)
+            return got
+
+        got = _ask(llm, [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                   _parse, "window %d-%d" % (a, b))
         _dbg("window %d-%d -> added %d" % (a, b, len(got)))
         return got
 
-    results, failures = _run_windows(words, windows, _judge, progress, (0.45, 0.55), "LLM dedup")
+    results, failures = _run_windows(windows, _judge, lambda win: _time_range(words, win[1], win[2] - 1),
+                                     progress, span, "LLM dedup")
     deleted = set().union(*results.values())
     _dbg("LLM dedup total deleted = %d, failed windows = %d/%d" % (len(deleted), len(failures), len(windows)))
     return sorted(deleted), failures, len(windows)
@@ -1159,27 +1355,202 @@ def llm_review_cuts(words: List[Dict], llm: _LLMClient, proposed: Set[int], lock
         _, a, b, _ = win
         user_prompt = _window_prompt(words, win, rules, "Return ONLY a JSON object {\"restore\":[...],\"delete\":[...]} "
                                      "using GLOBAL index numbers.", language, proposed)
-        content = llm.complete([{"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt}])
-        _dbg("review window %d-%d reply (%d chars): %s" % (a, b, len(content), content[:3000]))
-        restore, delete = _parse_review(content)
         restorable = {i for i in proposed if a <= i < b and i not in locked}
-        restore &= restorable
-        delete = {i for i in delete if a <= i < b and i not in proposed}
-        # 只看这次回复自己补删了多少，和还留着的词比：之前各轮已经删掉的不算在它头上，
-        # 否则重说很多的段落（已删词本来就超过上限）无论回复什么都会被判成失败
-        _check_delete_ratio(len(delete), b - a - sum(1 for i in proposed if a <= i < b))
-        if len(restorable) >= _LLM_RESTORE_GUARD_MIN and len(restore) > _LLM_MAX_RESTORE_RATIO * len(restorable):
-            raise ValueError("the reply restored %d of %d cuts, which looks wrong, so it was not applied"
-                             % (len(restore), len(restorable)))
-        return restore, delete
 
-    results, failures = _run_windows(words, windows, _judge, progress, span, label)
+        def _parse(content: str) -> Tuple[Set[int], Set[int]]:
+            restore, delete = _parse_review(content)
+            restore &= restorable
+            delete = {i for i in delete if a <= i < b and i not in proposed}
+            # 只看这次回复自己补删了多少，和还留着的词比：之前各轮已经删掉的不算在它头上，
+            # 否则重说很多的段落（已删词本来就超过上限）无论回复什么都会被判成失败
+            _check_delete_ratio(len(delete), b - a - sum(1 for i in proposed if a <= i < b))
+            if len(restorable) >= _LLM_RESTORE_GUARD_MIN and len(restore) > _LLM_MAX_RESTORE_RATIO * len(restorable):
+                raise ValueError("the reply restored %d of %d cuts, which looks wrong, so it was not applied"
+                                 % (len(restore), len(restorable)))
+            return restore, delete
+
+        return _ask(llm, [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                    _parse, "review window %d-%d" % (a, b))
+
+    results, failures = _run_windows(windows, _judge, lambda win: _time_range(words, win[1], win[2] - 1),
+                                     progress, span, label)
     restored = {i for restore, _ in results.values() for i in restore}
     added = {i for _, delete in results.values() for i in delete}
     _dbg("LLM review: restored %d, deleted %d more, failed windows = %d/%d"
          % (len(restored), len(added), len(failures), len(windows)))
     return restored, added, failures, len(windows)
+
+
+# ---- 按句判定：画外话和整句重说 ----
+# 一行是一句话或一个短语：在句末标点、已有的剪切处、不短于 _LINE_PAUSE_SEC 的停顿处换行。
+# 对照人工修正过的工程实测（85 分钟口播，人工在工具保留的词里又删掉 1022 个）：这样分行，整行删除能表达其中的
+# 923 个词，只连带 4 个不该删的词；只按标点分行是 775 个和 58 个。再按逗号或大写细分，几乎没有增益
+_LINE_PAUSE_SEC = 0.7
+_LINE_COMMA_WORDS = 30       # 一行超过这么多词，遇到逗号也换行
+_LINE_MAX_WORDS = 60         # 一行最多这么多词（转写没有标点时的保底）
+_LINE_PAUSE_NOTE_SEC = 2.0   # 行前的沉默不短于这么久，才在提示词里写出来
+# 窗口比逐词判定大：一行只占提示词的一行，而整段重说可能隔着好几句话
+_TAKE_WINDOW_WORDS, _TAKE_CONTEXT_WORDS = 600, 300
+TAKE_READINGS = 2            # 每一行读几遍（各遍的窗口边界互相错开）。每一遍都认定该剪才剪，否则只做标记
+TAKE_MODES = ("cut", "mark", "off")  # 认定的行：剪掉 / 只做标记不剪 / 不做按句判定
+
+
+def _lines(words: List[Dict], del_set: Set[int]) -> List[List[int]]:
+    """把保留的词分成行，返回每行的词下标。"""
+    lines: List[List[int]] = []
+    cur: List[int] = []
+    for i, w in enumerate(words):
+        if i in del_set:
+            continue
+        if cur:
+            prev = cur[-1]
+            last = words[prev]["word"].rstrip()
+            if (last.endswith(_SENTENCE_END) or i != prev + 1
+                    or float(w["start"]) - float(words[prev]["end"]) >= _LINE_PAUSE_SEC
+                    or len(cur) >= _LINE_MAX_WORDS
+                    or (len(cur) >= _LINE_COMMA_WORDS and last.endswith((",", ";", "，", "；", "、")))):
+                lines.append(cur)
+                cur = []
+        cur.append(i)
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _silence_before(words: List[Dict], lines: List[List[int]], n: int) -> float:
+    """说第 n 行之前说话人沉默了多久：它和上一行之间的时间，减去中间被删掉的词占的时间。"""
+    if n == 0:
+        return 0.0
+    first, prev = lines[n][0], lines[n - 1][-1]
+    gap = float(words[first]["start"]) - float(words[prev]["end"])
+    spoken = sum(max(0.0, float(words[i]["end"]) - float(words[i]["start"])) for i in range(prev + 1, first))
+    return max(0.0, gap - spoken)
+
+
+def _line_rows(words: List[Dict], lines: List[List[int]], a: int, b: int, sep: str, language: str) -> List[str]:
+    """把第 a 到 b-1 行格式化成提示词里的文本：行号、行前的长停顿、这一行的内容。"""
+    note = "（停顿 %d 秒后）" if _norm_language(language) == "zh" else "(after a %d s pause) "
+    rows = []
+    for n in range(a, b):
+        silence = _silence_before(words, lines, n)
+        rows.append("L%d  %s%s" % (n, note % round(silence) if silence >= _LINE_PAUSE_NOTE_SEC else "",
+                                   sep.join(words[i]["word"].strip() for i in lines[n])))
+    return rows
+
+
+def _line_windows(lines: List[List[int]], first: int) -> List[Tuple[int, int, int, int]]:
+    """按词数把行切成窗口，返回 (上下文起点, 判定起点, 判定终点, 上下文终点)，都是行号。
+    first 是第一窗判定的词数，其余每窗约 _TAKE_WINDOW_WORDS 个词；上下文前后各约 _TAKE_CONTEXT_WORDS 个词。"""
+    bounds, count, target = [0], 0, first
+    for n, idxs in enumerate(lines[:-1]):
+        count += len(idxs)
+        if count >= target:
+            bounds.append(n + 1)
+            count, target = 0, _TAKE_WINDOW_WORDS
+    bounds.append(len(lines))
+    windows = []
+    for a, b in zip(bounds, bounds[1:]):
+        ctx_a, ctx_b, before, after = a, b, 0, 0
+        while ctx_a > 0 and before < _TAKE_CONTEXT_WORDS:
+            ctx_a -= 1
+            before += len(lines[ctx_a])
+        while ctx_b < len(lines) and after < _TAKE_CONTEXT_WORDS:
+            after += len(lines[ctx_b])
+            ctx_b += 1
+        windows.append((ctx_a, a, b, ctx_b))
+    return windows
+
+
+def llm_judge_lines(words: List[Dict], del_set: Set[int], llm, progress=None, language: str = "en",
+                    span: Tuple[float, float] = (0.51, 0.55)
+                    ) -> Tuple[Dict[int, str], Dict[int, str], List[Tuple[str, str]], int]:
+    """按句判定：读删掉口误之后剩下的内容，找出整行该剪的：画外话（off）和后面又说了一遍的前一版（retake）。
+    返回 ({词下标: 原因} 要剪的, {词下标: 原因} 留下但存疑的, 失败窗口的 (时间范围, 错误), 窗口总数)。
+
+    每一行读 TAKE_READINGS 遍，各遍的窗口边界互相错开，同一行每次都和不同的上下文一起读。
+    每一遍都认定该剪的行才剪；只有一部分认定、或者模型自己说拿不准的行留在成片里，标成存疑交给人工确认：
+    整句误删很难发现（成片里少一句话并不显眼），漏删一听就知道，所以拿不准时宁可留着。
+    前一版要指明取代它的后一行，而且那一行必须留在成片里：同一段内容的各版不会全被剪掉。
+    只有一个窗口的短录音，各遍读到的内容完全相同，只是同一个问题问了两次：这样的核对比换一段上下文再读要弱。
+    """
+    lines = _lines(words, del_set)
+    if not lines:
+        return {}, {}, [], 0
+    rules, system_prompt = _take_prompts(language)
+    before_note, judge_note, after_note = _LINE_WINDOW_NOTES[_norm_language(language)]
+    sep = _word_sep(language)
+    size = [len(idxs) for idxs in lines]
+    windows = [(r,) + win for r in range(TAKE_READINGS)
+               for win in _line_windows(lines, _TAKE_WINDOW_WORDS * (TAKE_READINGS - r) // TAKE_READINGS)]
+
+    def _judge(win) -> Tuple[Set[int], Dict[int, int], Set[int]]:
+        r, ctx_a, a, b, ctx_b = win
+        rows = [judge_note] + _line_rows(words, lines, a, b, sep, language)
+        if ctx_a < a:
+            rows = [before_note] + _line_rows(words, lines, ctx_a, a, sep, language) + rows
+        if b < ctx_b:
+            rows += [after_note] + _line_rows(words, lines, b, ctx_b, sep, language)
+        user_prompt = (rules + "\n\n---\n\nTRANSCRIPT (one numbered line per sentence or phrase):\n" + "\n".join(rows)
+                       + "\n\nReturn ONLY a JSON object {\"off_script\":[...],\"earlier_take\":[[...]],\"unsure\":[...]} "
+                         "using the line numbers.")
+
+        def _parse(content: str) -> Tuple[Set[int], Dict[int, int], Set[int]]:
+            off, pairs, unsure = _parse_takes(content)
+            off = {n for n in off if a <= n < b}
+            # 取代前一版的那一行必须在它后面，而且是这个窗口里看得到的行
+            later = {x: y for x, y in pairs if a <= x < b and x < y < ctx_b and x not in off}
+            retake: Dict[int, int] = {}
+            for x, y in later.items():
+                while y in later:  # 取代它的那一行自己也是前一版：顺着找到最后留下的那一行
+                    y = later[y]
+                if y not in off:
+                    retake[x] = y
+            named = {x for x, _ in pairs} | unsure
+            unsure = {n for n in named if a <= n < b and n not in off and n not in retake}
+            _check_delete_ratio(sum(size[n] for n in off | set(retake)), sum(size[a:b]))
+            return off, retake, unsure
+
+        # 短录音只有一个窗口时，各遍的请求一字不差：按第几遍分开存，重跑时两遍用的还是各自的回复
+        return _ask(llm, [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                    _parse, "line window %d/L%d-L%d" % (r + 1, a, b), ask=r)
+
+    results, failures = _run_windows(
+        windows, _judge, lambda win: _time_range(words, lines[win[2]][0], lines[win[3] - 1][-1]),
+        progress, span, "Line check")
+    # 每一遍认定该剪的行：行号 -> 取代它的那一行（画外话没有，记 None）
+    sure: List[Dict[int, Optional[int]]] = [{} for _ in range(TAKE_READINGS)]
+    maybe: Set[int] = set()
+    for win, (off, retake, unsure) in results.items():
+        sure[win[0]].update(dict.fromkeys(off))
+        sure[win[0]].update(retake)
+        maybe |= unsure
+    agreed = set(sure[0]).intersection(*sure[1:])
+
+    def _replaced(n: int) -> bool:
+        """第 n 行是前一版时，至少有一遍给出的「取代它的那一行」留在成片里。"""
+        for reading in sure:
+            y = reading[n]
+            while y is not None and y in agreed and reading.get(y) is not None:
+                y = reading[y]
+            if y is not None and y not in agreed:
+                return True
+        return False
+
+    cut_lines = {n for n in agreed if any(reading[n] is None for reading in sure) or _replaced(n)}
+    cut: Dict[int, str] = {}
+    flag: Dict[int, str] = {}
+    for n in sorted(set().union(maybe, *sure)):
+        whys = ["off" if reading[n] is None else "retake" for reading in sure if n in reading]
+        why = "unsure" if not whys else "off" if "off" in whys else "retake"
+        target = cut if n in cut_lines else flag
+        target.update(dict.fromkeys(lines[n], why))
+        _dbg("line check %s [%s] L%d @%s: %s" % ("cut" if n in cut_lines else "flag", why, n,
+                                                 _timecode(words[lines[n][0]]["start"]),
+                                                 sep.join(words[i]["word"].strip() for i in lines[n])[:200]))
+    _dbg("line check: %d lines, cut %d (%d words), flagged %d (%d words), failed windows = %d/%d"
+         % (len(lines), len(cut_lines), len(cut), len(set().union(maybe, *sure)) - len(cut_lines), len(flag),
+            len(failures), len(windows)))
+    return cut, flag, failures, len(windows)
 
 
 # ---- 用真实音频校准切点 ----
@@ -1486,10 +1857,23 @@ _UNHEARD_MIN_CHARS_ZH = 2
 REVIEW_PASSES = 2          # 默认听几遍：第一遍发现并修改，第二遍确认修改后的成片
 
 
-def _edit_tokens(words: List[Dict], proposed: Set[int], locked: Set[int]) -> List[Dict]:
-    """把转写的词变成带剪辑标记的 token：cut 记录它是被谁删掉的（None 表示保留），locked 表示不能恢复。"""
-    return [{"word": w["word"], "start": float(w["start"]), "end": float(w["end"]),
-             "cut": "first" if i in proposed else None, "locked": i in locked} for i, w in enumerate(words)]
+def _edit_tokens(words: List[Dict], proposed: Set[int], locked: Set[int], takes: Optional[Dict[int, str]] = None,
+                 flags: Optional[Dict[int, str]] = None) -> List[Dict]:
+    """把转写的词变成带剪辑标记的 token：cut 记录它是被谁删掉的（None 表示保留），locked 表示复核不能恢复。
+
+    takes 是按句判定整行剪掉的词（cut 记成原因，见 _TAKE_CUTS）：它们读过 TAKE_READINGS 遍才定下来，复核不再恢复。
+    flags 是留在成片里但存疑的词（flag 记成原因）：不影响剪辑，只在剪辑清单和 Premiere 工程里标出来。
+    """
+    takes, flags = takes or {}, flags or {}
+    tokens = []
+    for i, w in enumerate(words):
+        cut = "first" if i in proposed else takes.get(i)
+        token = {"word": w["word"], "start": float(w["start"]), "end": float(w["end"]),
+                 "cut": cut, "locked": i in locked or cut in _TAKE_CUTS}
+        if not cut and i in flags:
+            token["flag"] = flags[i]
+        tokens.append(token)
+    return tokens
 
 
 def _cut_indices(tokens: List[Dict]) -> Set[int]:
@@ -1863,44 +2247,147 @@ def _review_summary(totals: collections.Counter) -> str:
     return text
 
 
+def _check_points(tokens: List[Dict], language: str = "en") -> List[Dict]:
+    """值得人工先看的地方，按时间排序：整行剪掉的（kind 为 "cut"）和留在成片里但存疑的（kind 为 "flag"）。
+
+    每一项有 kind、why（给人看的原因）、start / end（素材秒）和 text。相邻的同类行合成一项；
+    中间夹着的其他被删词（口误、残音）不算间隔，也不进 text。
+    存疑片段的 start / end 取它和前后词之间的中点：Premiere 工程在这里把片段切开，
+    用户删掉这一段之后，它前后的停顿各留下一半。
+    """
+    sep = _word_sep(language)
+    groups: List[Tuple[str, List[int]]] = []
+    current: Optional[Tuple[str, List[int]]] = None
+    for i, t in enumerate(tokens):
+        cut = t.get("cut")
+        kind = "cut" if cut in _TAKE_CUTS else "flag" if not cut and t.get("flag") else None
+        if kind is None:
+            if not cut:  # 正常保留的词把前后隔开
+                current = None
+            continue
+        if current is None or current[0] != kind:
+            current = (kind, [])
+            groups.append(current)
+        current[1].append(i)
+
+    points = []
+    for kind, idxs in groups:
+        a, b = idxs[0], idxs[-1]
+        whys = {tokens[i]["cut"] if kind == "cut" else tokens[i]["flag"] for i in idxs}
+        why = ("off-script" if whys == {"off"} else "earlier take" if whys == {"retake"}
+               else "off-script and earlier take" if kind == "cut" else "off-script or earlier take")
+        start, end = float(tokens[a]["start"]), float(tokens[b]["end"])
+        if kind == "flag":
+            why += "?"
+            start = (float(tokens[a - 1]["end"]) + start) / 2 if a else 0.0
+            end = (end + float(tokens[b + 1]["start"])) / 2 if b + 1 < len(tokens) else end + 1.0
+        points.append({"kind": kind, "why": why, "start": round(start, 3), "end": round(max(start, end), 3),
+                       "text": sep.join(tokens[i]["word"].strip() for i in idxs)})
+    return points
+
+
+def _line_check_summary(points: List[Dict]) -> str:
+    """一句话说明按句判定做了什么，给页面和剪辑清单用。"""
+    cut = sum(1 for p in points if p["kind"] == "cut")
+    flagged = len(points) - cut
+    if not points:
+        return ""
+
+    def _count(n: int) -> str:
+        return "%d %s" % (n, "passage" if n == 1 else "passages")
+
+    parts = []
+    if cut:
+        parts.append("cut %s that %s off-script or an earlier take of something said again later"
+                     % (_count(cut), "is" if cut == 1 else "are"))
+    if flagged:
+        parts.append("kept %s that may be off-script or an earlier take, for you to check" % _count(flagged))
+    return ("Line check: %s. They are listed at the top of the cut list and marked in the Premiere sequence."
+            % ", and ".join(parts))
+
+
 def write_cut_list(tokens: List[Dict], keep: List[Tuple[float, float]], path: str, language: str = "en",
-                   summary: str = "") -> None:
+                   notes: Tuple[str, ...] = (), points: Tuple[Dict, ...] = ()) -> None:
     """写一份可通读的剪辑清单，方便检查删了什么，再到 Premiere 里修正。
 
-    按句分行，第一轮删的词标成 [-这样-]，复核时删的（漏掉的口误、接缝处漏进来的残音）标成 [--这样--]，
-    第一轮要删、复核恢复的标成 [+这样+]。行首是这句在成片（序列）里的时间和在原始素材里的时间。
+    开头先列出最值得看的地方（points，见 _check_points）：整行剪掉的和存疑保留的。
+    然后是全文，按句分行：第一轮删的词标成 [-这样-]，按句判定整行剪掉的标成 [=这样=]，存疑保留的标成 [?这样?]，
+    复核时删的（漏掉的口误、接缝处漏进来的残音）标成 [--这样--]，第一轮要删、复核恢复的标成 [+这样+]。
+    每行开头是它在成片（序列）里的时间和在原始素材里的时间。notes 是写在说明后面的几句总结。
     """
     timeline = _EditTimeline(keep)
 
     def _mark(i: int) -> Optional[str]:
         cut = tokens[i].get("cut")
         if cut:
-            return "[-%s-]" if cut == "first" else "[--%s--]"
-        return "[+%s+]" if tokens[i].get("restored") else None
+            return "[-%s-]" if cut == "first" else "[=%s=]" if cut in _TAKE_CUTS else "[--%s--]"
+        return "[+%s+]" if tokens[i].get("restored") else "[?%s?]" if tokens[i].get("flag") else None
 
-    added = sum(1 for t in tokens if t.get("cut") not in (None, "first"))
+    added = sum(1 for t in tokens if t.get("cut") and t["cut"] != "first" and t["cut"] not in _TAKE_CUTS)
     restored = sum(1 for t in tokens if t.get("restored") and not t.get("cut"))
     sep = _word_sep(language)
     with open(path, "w", encoding="utf-8") as f:
-        f.write("Cut list. Deleted words are marked [-like this-]. The review deleted [--these--] (%d words: mis-speaks "
-                "the first pass missed, and leftover sounds it heard at the cuts) and kept [+these+] (%d words) that "
-                "the first pass deleted.%s Columns: time in the edited sequence, time in the source, text.\n\n"
-                % (added, restored, " " + summary if summary else ""))
+        f.write("Cut list. Columns: time in the edited sequence, time in the source, text.\n"
+                "  [-like this-]    deleted by the first pass: mis-speaks, restarts, repeats and filler sounds\n"
+                "  [=like this=]    whole lines cut by the line check: off-script remarks, or an earlier take of "
+                "something said again later\n"
+                "  [?like this?]    kept, but the line check suspects it is off-script or an earlier take\n"
+                "  [--like this--]  deleted by the review (%d words): mis-speaks the first pass missed, and leftover "
+                "sounds heard at the cuts\n"
+                "  [+like this+]    deleted by the first pass, kept by the review (%d words)\n" % (added, restored))
+        for note in notes:
+            if note:
+                f.write(note + "\n")
+        if points:
+            f.write("\nCheck first (%d places):\n" % len(points))
+            for p in points:
+                f.write("  %s  %s  %-34s %s\n" % (_timecode(timeline.to_edit(p["start"])), _timecode(p["start"]),
+                                                  ("cut: " if p["kind"] == "cut" else "kept: ") + p["why"], p["text"]))
+        f.write("\nFull transcript:\n")
         for idxs in _utterances(tokens, 0, len(tokens)):
             start = float(tokens[idxs[0]]["start"])
             f.write("%s  %s  %s\n" % (_timecode(timeline.to_edit(start)), _timecode(start),
                                       _marked_text(tokens, idxs, sep, _mark)))
 
 
+def save_edit(out_path: str, audio_path: str, tokens: List[Dict], keep: List[Tuple[float, float]],
+              total_dur: float, language: str, points: List[Dict]) -> str:
+    """把这次的逐词判定和保留区间存到 EDIT_DIR（文件名跟输出文件走），返回路径。
+
+    evaluate.py 用它和人工修正后的 Premiere 工程对照，算出漏删和误删。任务结束后 token 就没有了，
+    不存下来就只能从调试日志里拼。
+    """
+    os.makedirs(EDIT_DIR, exist_ok=True)
+    path = os.path.join(EDIT_DIR, os.path.splitext(os.path.basename(out_path))[0] + ".json")
+    rows = []
+    for t in tokens:
+        row = {"word": t["word"], "start": round(float(t["start"]), 3), "end": round(float(t["end"]), 3)}
+        row.update((k, t[k]) for k in ("cut", "flag", "restored", "heard") if t.get(k))
+        rows.append(row)
+    data = {"version": 1, "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+            "source": os.path.abspath(audio_path), "output": os.path.abspath(out_path), "language": language,
+            "total_sec": round(total_dur, 3), "keep": [[round(s, 3), round(e, 3)] for s, e in keep],
+            "check": points, "tokens": rows}
+    with open(path + ".part", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(path + ".part", path)
+    return path
+
+
 def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key: str,
                 whisper_model: str = "large", language: str = "en", keep_gap: float = 0.8,
                 out_format: str = "auto", out_bitrate: str = "320k",
-                progress=None, api_mode: str = "auto", review_passes: int = REVIEW_PASSES, *, work_dir: str) -> Dict:
+                progress=None, api_mode: str = "auto", review_passes: int = REVIEW_PASSES,
+                take_mode: str = "cut", *, work_dir: str) -> Dict:
     """去重：只保留有文字的段落(词所在区域)，再减去语气词和 LLM 判重标记的词；无文字(静音)自然被切掉。
+    接着按句判定（llm_judge_lines）：找出整行的画外话和后面重说过的前一版。take_mode 为 "cut" 时剪掉认定的行，
+    "mark" 时只做标记不剪，"off" 时跳过这一步。
     然后听成片（review_edit）：把剪好的结果重新转写 review_passes 遍，修掉只有听才能发现的问题。
 
     返回结果里的 warnings 列出没有完全按要求完成的部分（如 LLM 窗口失败），需要展示给用户。
     """
+    if take_mode not in TAKE_MODES:
+        raise ValueError("take_mode must be one of %s" % ", ".join(TAKE_MODES))
     language = _norm_language(language)
     total_dur = _audio_duration(audio_path)
     warnings: List[str] = []
@@ -1949,13 +2436,28 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     proposed = auto | set(llm_indices)
     _dbg("first pass: LLM word indices(%d)+auto(%d) -> %d deleted" % (len(llm_indices), len(auto), len(proposed)))
 
+    # 按句判定：第一轮只认得出口误，画外话和换了说法的重说要整句地读才看得出来
+    takes: Dict[int, str] = {}
+    flags: Dict[int, str] = {}
+    if take_mode != "off":
+        _report(progress, 0.51, "Line check: looking for off-script lines and earlier takes…")
+        takes, flags, take_failures, take_windows = llm_judge_lines(words, proposed, llm, progress=progress,
+                                                                    language=language)
+        if take_failures:
+            warnings.append("The line check failed for %d of %d windows, so off-script lines and earlier takes in "
+                            "these parts of the source may remain or are only marked: %s. First error: %s"
+                            % (len(take_failures), take_windows, ", ".join(sorted({where for where, _ in take_failures})),
+                               take_failures[0][1]))
+        if take_mode == "mark":
+            takes, flags = {}, {**flags, **takes}
+
     # 第二轮：听成片。切点从这里开始就校准到真实音频的空隙上，听到的和最后交付的是同一种切法
     _report(progress, 0.55, "Measuring loudness to place the cut points…")
     env = _loudness_envelope(audio_path)
     tokens, totals, review_warnings = review_edit(
-        audio_path, _edit_tokens(words, proposed, auto), llm, whisper_model=whisper_model, language=language,
-        keep_gap=keep_gap, env=env, total_dur=total_dur, passes=max(1, int(review_passes)), work_dir=work_dir,
-        progress=progress, span=(0.56, 0.90))
+        audio_path, _edit_tokens(words, proposed, auto, takes, flags), llm, whisper_model=whisper_model,
+        language=language, keep_gap=keep_gap, env=env, total_dur=total_dur, passes=max(1, int(review_passes)),
+        work_dir=work_dir, progress=progress, span=(0.56, 0.90))
     warnings.extend(review_warnings)
     review_summary = _review_summary(totals)
     del_set = _cut_indices(tokens)
@@ -1968,12 +2470,19 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     _dbg("keep blocks after LLM = %d: %s" % (len(keep), [(round(s,2), round(e,2)) for s,e in keep[:40]]))
     if not keep:
         raise RuntimeError("Nothing left after filtering.")
+    points = _check_points(tokens, language)
+    line_summary = _line_check_summary(points)
     out_cuts = os.path.splitext(out_wav)[0] + "_cuts.txt"
     try:
-        write_cut_list(tokens, keep, out_cuts, language, review_summary)
+        write_cut_list(tokens, keep, out_cuts, language, (line_summary, review_summary), points)
     except OSError as e:  # 只是辅助文件，写不出来不值得丢掉前面的结果
         out_cuts = None
         warnings.append("The cut list could not be written: %s" % str(e)[:200])
+    out_edit = None
+    try:
+        out_edit = save_edit(out_wav, audio_path, tokens, keep, total_dur, language, points)
+    except OSError as e:  # 只用于事后评测，同样不值得丢掉结果
+        _dbg("[warn] could not save the edit record: %r" % str(e)[:200])
     _report(progress, 0.90, f"Splicing ({out_format})…")
     _splice_keep(audio_path, keep, out_wav, out_format=out_format, out_bitrate=out_bitrate,
                  work_dir=work_dir, progress=progress)
@@ -1981,7 +2490,7 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
     project_path = None
     try:
         project_path, project_warning = premiere.export_project(
-            audio_path, keep, os.path.splitext(out_wav)[0], work_dir, log=_dbg)
+            audio_path, keep, os.path.splitext(out_wav)[0], work_dir, log=_dbg, checks=points)
         if project_warning:
             warnings.append(project_warning)
         # 上传的文件在任务结束时删除，工程里的素材要重新链接；本地路径模式不受影响
@@ -2004,6 +2513,8 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
         "out_wav": out_wav,
         "out_project": project_path,
         "out_cuts": out_cuts,
+        "out_edit": out_edit,
+        "lines": line_summary,
         "review": review_summary,
         "warnings": warnings,
     }
@@ -2021,6 +2532,8 @@ if __name__ == "__main__":
     ap.add_argument("--language", default="en")
     ap.add_argument("--whisper", default="large")
     ap.add_argument("--review-passes", type=int, choices=[1, 2, 3], default=REVIEW_PASSES)
+    ap.add_argument("--take-mode", choices=TAKE_MODES, default="cut",
+                    help="off-script lines and earlier takes: cut them, only mark them, or skip the line check")
     a = ap.parse_args()
     # 输出容器跟随 --out 的扩展名，否则 AAC 源配 b.wav 会写出内容与扩展名不符的文件
     out_ext = os.path.splitext(a.out)[1].lower().lstrip(".")
@@ -2028,6 +2541,7 @@ if __name__ == "__main__":
     try:
         info = dedup_audio(a.audio, a.out, a.api_url, a.model, a.api_key, a.whisper,
                            language=a.language, api_mode=a.api_mode, review_passes=a.review_passes,
+                           take_mode=a.take_mode,
                            out_format=out_ext if out_ext in ("wav", "flac", "mp3") else "auto",
                            work_dir=job_dir)
     finally:

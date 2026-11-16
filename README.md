@@ -26,19 +26,25 @@ parts.
    earlier repeats"** rule, and returns the indices to delete.
 4. **Guaranteed cleanups** — bracketed vocal sounds and core fillers are always removed,
    independent of the LLM.
-5. **Re-assembly** — keeps only the non-deleted words (deleted words break the block) and
+5. **Line check: off-script remarks and earlier takes** — the LLM then reads what is left, one
+   sentence per line, as an editor would, and looks for whole lines that do not belong in the
+   video: the speaker talking to themselves (`my god it's laggy, why?`), notes about the recording
+   (`I'll record the voice after`), and an earlier take of something that is said again later in
+   other words. Every line is read twice, each time with different surrounding text. A line is cut
+   only when both readings agree. The rest stay in the edit and are marked for you to check.
+6. **Re-assembly** — keeps only the non-deleted words (deleted words break the block) and
    snaps each cut to a real gap in the audio, because word timestamps alone clip endings and
    let the tail of a deleted word through.
-6. **ASR review: listening to the edit** — renders the cut audio and transcribes *it* again,
+7. **ASR review: listening to the edit** — renders the cut audio and transcribes *it* again,
    word by word, then compares what is heard with what was planned. This finds what the
    transcript cannot show: the start or end of a deleted word that leaked through a cut, a kept
    word that a cut chopped (`situation` heard as `situa-`), and mis-speaks the first transcription
    missed. Leftovers are trimmed, chopped words get their cut moved to the next real gap, and the
    LLM reads the text that was actually heard to restore wrongly deleted words and delete what
    should not be there. By default the edit is listened to twice, so the fixes are checked too.
-7. **Export** — a clean `wav` / `flac` / `mp3`, a **Premiere Pro project** whose sequence
-   cuts the original video and audio together, and a **cut list** that shows the deleted words in
-   the transcript, for human correction.
+8. **Export** — a clean `wav` / `flac` / `mp3`, a **Premiere Pro project** whose sequence
+   cuts the original video and audio together and marks the passages worth checking, and a
+   **cut list** that shows the deleted words in the transcript, for human correction.
 
 ---
 
@@ -51,6 +57,8 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
                                                                         │
                 LLM (DeepSeek) windowed, per-word dedup ──────────▶ delete indices
                                                                         │
+     LLM line check, two readings: off-script lines, earlier takes ──▶ cut lines + marked lines
+                                                                        │
                         clean_keep_blocks ──▶ kept blocks ──▶ draft edit
                                                                         │
       ┌──── ASR review, repeated for each pass ─────────────────────────┤
@@ -61,7 +69,8 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
       └──────────────────────────────────────────────▶ revised kept blocks
                                                                         │
          ffmpeg streaming splice ──▶ out.wav
-         FCP XML ──▶ local Premiere imports and saves ──▶ out.prproj
+         FCP XML with markers ──▶ local Premiere imports and saves ──▶ out.prproj
+         word-by-word edit record ──▶ .work\edits\out.json ──▶ evaluate.py
 ```
 
 - **Transcription** (of the source, and of the edit in each review pass) runs in a separate
@@ -75,6 +84,16 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
 - **Verbatim ASR** that keeps disfluencies, so they can actually be deleted.
 - **AI dedup** with a clear per-word rule (keep the last, delete the earlier), windowed
   so it stays fast and reliable on long files.
+- **Off-script remarks and earlier takes**: the line check removes what a per-word rule cannot
+  see. It exists because of a measurement. On an 85-minute recording that was then corrected by
+  hand in Premiere, the per-word pass had removed 1,624 of the 2,591 words that had to go (63%),
+  and none of its deletions was put back. The 967 words it left were in 79 places, almost all of
+  them off-script remarks or earlier takes of a whole sentence. How many of these the line check
+  finds depends on the LLM and has not been measured yet: `evaluate.py` measures it once you have
+  corrected a project (see below).
+- **A short list to check instead of the whole edit**: every line the line check cut, and every
+  line it was not sure about, has a marker in the Premiere sequence and an entry at the top of the
+  cut list.
 - **No residue / no clicks**: deleted segments are removed entirely, including their
   cut-padding edges.
 - **The result is listened to, not only read**: the edit is transcribed again and compared
@@ -87,8 +106,10 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
   retried after the others finish, at lower concurrency. If it still fails, it is reported as a
   warning next to the result with its time range, never hidden. A reply that deletes more than
   60% of a window is treated as a failure, because losing speech is worse than keeping a mis-speak.
-- **Fast re-runs**: the transcript of a local file is saved, so running the same file again goes
-  straight to the LLM. Transcription is by far the slowest step.
+- **Fast, repeatable re-runs**: the transcript of a local file is saved, so running the same file
+  again goes straight to the LLM. Transcription is by far the slowest step. The LLM's replies are
+  saved too, so the same request gets the same answer: after a change to a later step, any
+  difference in the result comes from that change.
 - **Multiple outputs**: lossless `wav` / `flac`, high-bitrate `mp3`, and a **Premiere Pro
   project** that references the original file, with linked video and audio clips.
 - **Offline model loading**: once the model is cached, it is loaded without touching the
@@ -162,6 +183,26 @@ is loaded **offline**.
   If no reasoning setting is accepted, the result carries a warning. The settings found by the
   check are then used for every window. A later request can only give up JSON mode; it never
   drops reasoning to get an answer, and a window that still fails is retried and then reported.
+- **Line check** reads the words the dedup kept, split into lines at sentence ends, at existing
+  cuts and at pauses of 0.7 s or more. The LLM names each line it would cut as off-script or as an
+  earlier take, and for an earlier take it must name the later line that replaces it. It can also
+  list a line as "unsure".
+  - Every line is read `TAKE_READINGS` times (`dedup.py`, default 2) in windows of about 600 words
+    with 300 words of context, and the windows of the second reading start half a window later.
+    A recording short enough to fit in one window is asked the same question twice instead,
+    which is a weaker check.
+  - A line is cut only when every reading would cut it. A line that only one reading would cut, or
+    that a reading lists as unsure, stays in the edit and is marked. A missing sentence is hard to
+    notice in the finished video and a leftover one is easy to hear, so in doubt the line stays.
+  - An earlier take is cut only if the line that replaces it stays, so the takes of one passage are
+    never all cut.
+  - The LLM review cannot restore a line cut here.
+  - The web form has three settings: cut and mark (default), only mark, or off. With "off" the
+    edit is the same as before the line check existed.
+- **Saved LLM replies**: a reply that passed the checks is saved in `.work\llm_cache\`, keyed by
+  the API URL, the model, the request settings and the full request text. Running the same file
+  again with the same settings reuses the replies, so the result is the same. Delete the folder to
+  ask the LLM again. A reply that was refused (bad format, deleted too much) is never saved.
 - **ASR review** listens to the edit `REVIEW_PASSES` times (`dedup.py`, default 2; the web form
   offers 1 to 3). Each pass transcribes the whole edit again, on top of the first transcription:
   11 to 16 minutes for a 27-minute edit on an RTX 5070 Ti. What a pass changes can only be heard in the next
@@ -206,10 +247,11 @@ Then open **http://127.0.0.1:7861**.
    and it is never modified or deleted.
 2. Fill in the **API URL**, **model name**, and **API key**. The page remembers your settings for
    next time, except the key and the file path.
-3. Choose the **Whisper model** (`large` default), how many **ASR review** passes to run, and the
-   output settings.
+3. Choose the **Whisper model** (`large` default), what the **line check** does with off-script
+   lines and earlier takes, how many **ASR review** passes to run, and the output settings.
 4. Close Premiere if it is open, then click **Start Processing**. Watch the live progress bar.
 5. Download the clean audio, and open the **`.prproj`** from the `output` folder.
+6. Go through the markers in the sequence (see below), then watch the edit once.
 
 ### The Premiere project
 
@@ -217,6 +259,19 @@ Then open **http://127.0.0.1:7861**.
   `.prproj`, and closes. Avoid using Premiere during that moment.
 - Open the `.prproj`: the sequence is already in the timeline, with each kept segment as a
   linked video and audio clip, for easy manual correction.
+- The sequence has a marker at every place the line check touched. Jump between them with
+  `Shift+M` and `Ctrl+Shift+M`:
+  - **`Cut: off-script`** / **`Cut: earlier take`** sits on the cut where whole lines were removed.
+    The marker's comment holds the removed text. To bring it back, drag the edge of the clip next
+    to the marker outwards.
+  - **`Check: …?`** spans a passage that was kept although the line check suspects it. The passage
+    is a clip of its own, with the Mango label colour, so you can select it and ripple-delete it.
+    Its edges sit in the middle of the pauses around it. If you renamed Premiere's label colours,
+    the clip keeps the default colour and only the marker shows it.
+- The same places are listed under "Check first" at the top of the cut list.
+- The markers and the label colour travel in the XML. This was checked with Premiere Pro 2025:
+  both come through the import. If a Premiere version drops the markers on import, the tool
+  creates them in Premiere before it saves the project.
 - It references the **original source file** when you used the local path. An uploaded file is
   deleted after processing, so relink it by name when prompted.
 - If Premiere was open or is not installed, you get an **`.xml`** and a warning instead. Use
@@ -238,17 +293,27 @@ Then open **http://127.0.0.1:7861**.
 - **`m4a`** — AAC, when "Match source" is selected and the source audio is AAC.
 - **`.prproj`** — Premiere Pro project (all kept segments, video and audio, referencing the source).
 - **`.xml`** — the same sequence for `File > Import`, when a `.prproj` could not be created.
-- **`<name>_cuts.txt`** — the transcript by sentence, with deleted words marked `[-like this-]`.
-  What the review deleted is marked `[--like this--]`: mis-speaks the first pass missed, and
-  leftover sounds it heard at the cuts. Words the first pass deleted but the review kept are marked
-  `[+like this+]`. The text also contains words that were only heard in the edit, which the first
-  transcription missed. The first line sums up what the ASR review did. Each line starts with its
-  time in the edited sequence and in the source, so you can read through the decisions and jump to
-  the ones you want to fix in Premiere.
+- **`<name>_cuts.txt`** — the cut list. It starts with a key to the marks and a summary of what
+  the line check and the ASR review did. Then comes **"Check first"**: the passages the line check
+  cut or was unsure about, each with its time in the edit and in the source. Then the full
+  transcript by sentence:
+  - `[-like this-]` — deleted by the first pass (mis-speaks, restarts, repeats, filler sounds).
+  - `[=like this=]` — whole lines cut by the line check.
+  - `[?like this?]` — kept, but the line check suspects it is off-script or an earlier take.
+  - `[--like this--]` — deleted by the review: mis-speaks the first pass missed, and leftover
+    sounds it heard at the cuts.
+  - `[+like this+]` — deleted by the first pass, kept by the review.
+
+  The text also contains words that were only heard in the edit, which the first transcription
+  missed. Each line starts with its time in the edited sequence and in the source, so you can read
+  through the decisions and jump to the ones you want to fix in Premiere.
 
 `output\` contains only these finished results. Intermediate files, temp files and the
 debug log live in `.work\`; each job's files are removed when it ends, and anything left
 by a forced shutdown is removed the next time the server starts.
+
+Each run also leaves an **edit record** in `.work\edits\<name>.json`: every word with its
+timestamps and what was decided about it, and the kept ranges. `evaluate.py` reads it.
 
 Transcripts of local files stay in `.work\transcripts\` (about 1 MB per hour of audio). A saved
 transcript is used only if the file (path, size, modified time), the Whisper model, the language
@@ -257,15 +322,54 @@ Uploaded files are not saved this way.
 
 ---
 
+## Measuring the result against your own correction
+
+After you have corrected an edit in Premiere and saved the project, that project is the answer
+key: what is still in the sequence should have been kept, and the rest should have gone.
+`evaluate.py` compares it with what the tool decided, word by word:
+
+```powershell
+.\.venv\Scripts\python.exe evaluate.py .work\edits\talk_deduped.json output\talk_deduped.prproj
+```
+
+It reports:
+
+- **Missed**: words the tool kept and you removed, with the text of each place, and how many of
+  them the line check had at least marked.
+- **Wrong**: words the tool removed and you put back, by the step that removed them.
+- **Cut points**: how many clip edges you moved by up to half a second.
+
+The answer key is stored in source time, so it also scores any later run on the same file. Change
+a prompt or a rule, run the file again (the transcript is reused), and compare the new edit record
+with the same project. Add `--save-truth .work\truth\talk.json` once to keep the answer key
+after the project changes, and pass that file instead of the project from then on.
+
+Differences of a single word are counted apart and left out of the scores. Most of them come
+from timestamps, where a word's time range includes the pause before it.
+
+### Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+The tests need no GPU, LLM or Premiere. They cover the line check with a stand-in LLM, the saved
+replies, the cut list, the Premiere XML, the evaluation, and one property of the ASR review: when
+the edit is heard exactly as planned, no cut moves.
+
+---
+
 ## Project layout
 
 ```
 Root Folder
   server.py              # Flask web server + SSE progress + upload/static
-  dedup.py               # dedup engine: transcription orchestration, LLM dedup,
+  dedup.py               # dedup engine: transcription orchestration, LLM dedup, line check,
                          #   keep-block building, ASR review of the edit, splice
-  premiere.py            # Premiere project: writes FCP XML, has Premiere save it as .prproj
+  premiere.py            # Premiere project: writes FCP XML with markers, has Premiere save it as .prproj
   faithful_transcribe.py # verbatim transcription subprocess (runs in global CUDA env)
+  evaluate.py            # compares an edit with a Premiere project corrected by hand
+  tests/                 # tests that need no GPU, LLM or Premiere
   start.bat              # one-click server launcher
   requirements.txt       # server venv dependencies
   .gitignore
@@ -295,6 +399,15 @@ Root Folder
   mis-speaks in the listed time ranges remain. If every window fails, the job stops with an error
   instead. Check `.work\debug.log` for the `window ... failed` lines. Running the file again
   reuses the transcript, so it only costs the LLM step.
+- **Warning: "The line check failed for N of M windows"** — in the listed time ranges a line was
+  read once instead of twice, or not at all. Lines read once are only marked, never cut, so
+  off-script lines and earlier takes may remain there. Running the file again asks only for the
+  windows that failed: the other replies are saved.
+- **The line check cut something that belongs in the video** — find its `Cut:` marker in the
+  sequence and drag the clip edge back out. If it happens often with your material, choose "Only
+  mark them" in the form, and tell the rules in `TAKE_RULES` (`dedup.py`) what to keep.
+- **Warning: "the N markers for the passages to check could not be added"** — the project itself
+  is complete. Use the "Check first" list at the top of the cut list instead.
 - **Warning: "The LLM review failed for N of M windows in pass P"** — the cuts in the listed time
   ranges were used without the LLM's check of that pass. Everything else is complete.
 - **Warning: "The edit could not be listened to"** — the transcriber failed on the cut audio (the

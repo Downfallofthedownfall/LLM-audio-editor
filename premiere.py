@@ -5,6 +5,10 @@ Premiere 工程输出：把保留片段变成一条视频和音频都剪好的�
   1) 写一份 FCP7 XML（Premiere 支持的交换格式），视频和音频片段互相链接；
   2) 让本机 Premiere 导入这份 XML 并存成 .prproj，工程由 Premiere 自己写出，版本也完全匹配。
 第 2 步做不了时（没装 Premiere、Premiere 正开着等）交付 XML，手动导入后结果相同。
+
+序列里还标出值得人工先看的地方（checks，来自 dedup._check_points）：
+  * 整行剪掉的（画外话、后面重说过的前一版）：在剪切处放一个标记，写着被剪掉的内容，恢复时把片段边缘拉回来；
+  * 留下但存疑的：切成单独的片段并换一种标签颜色，上面放一个带时长的标记，确认该删时选中它波纹删除。
 """
 import fractions, glob, json, os, re, shutil, subprocess, time, urllib.parse
 from typing import Callable, Dict, List, Optional, Tuple
@@ -17,6 +21,12 @@ TICKS_PER_SECOND = 254016000000
 MIN_CLIP_SEC = 0.04
 # 纯音频素材也要有序列帧率：帧率越高，切点取整的误差越小
 AUDIO_ONLY_TIMEBASE = 60
+# 存疑片段的标签颜色（Premiere 默认标签名）。用户改过标签名时不生效，片段保持默认颜色，标记仍然在
+FLAG_LABEL = "Mango"
+# 切出存疑片段时，两边剩下的片段不短于这么多，否则不在那里切（很短的片段进不了序列，会和音频文件对不上）
+MIN_PIECE_SEC = 0.15
+# 标记的说明里最多放这么多字的原文
+MARKER_TEXT_CHARS = 300
 
 
 class SourceUnreadable(RuntimeError):
@@ -69,26 +79,83 @@ def _timeline_rate(video: Optional[Dict]) -> Tuple[int, bool]:
     return nominal, abs(value - nominal * 1000 / 1001) < 0.02 and abs(value - nominal) > 0.02
 
 
-def _frame_spans(keep_blocks: List[Tuple[float, float]], fps: fractions.Fraction,
-                 total_frames: int) -> List[Tuple[int, int, int, int]]:
-    """把保留区间取整到帧，返回 (序列起点, 序列终点, 素材入点, 素材出点)。片段首尾相接，不重复任何一帧。"""
+def _split_at_flags(keep_blocks: List[Tuple[float, float]],
+                    flag_spans: List[Tuple[float, float]]) -> List[Tuple[float, float, bool]]:
+    """把保留区间在存疑片段的边界处切开，返回 [(起点, 终点, 是否存疑)]。
+
+    切出来的片段首尾相接，合起来和原来的区间完全一样：只是多了几个剪辑点，播出来的内容不变。
+    """
+    pieces: List[Tuple[float, float, bool]] = []
+    flags = sorted(flag_spans)
+    for start, end in sorted(keep_blocks):
+        position = start
+        for flag_start, flag_end in flags:
+            flag_start, flag_end = max(flag_start, position), min(flag_end, end)
+            if flag_end - flag_start < MIN_PIECE_SEC:
+                continue
+            if flag_start - position < MIN_PIECE_SEC:
+                flag_start = position
+            if end - flag_end < MIN_PIECE_SEC:
+                flag_end = end
+            if flag_start > position:
+                pieces.append((position, flag_start, False))
+            pieces.append((flag_start, flag_end, True))
+            position = flag_end
+        if end > position:
+            pieces.append((position, end, False))
+    return pieces
+
+
+def _frame_spans(pieces: List[Tuple[float, float, bool]], fps: fractions.Fraction,
+                 total_frames: int) -> List[Tuple[int, int, int, int, bool]]:
+    """把片段取整到帧，返回 (序列起点, 序列终点, 素材入点, 素材出点, 是否存疑)。片段首尾相接，不重复任何一帧。"""
     spans = []
     position = source_end = 0
-    for start, end in sorted(keep_blocks):
+    for start, end, flagged in sorted(pieces):
         if end - start <= MIN_CLIP_SEC:
             continue
         first = max(round(start * fps), source_end)
         last = min(round(end * fps), total_frames)
         if last <= first:
             continue
-        spans.append((position, position + last - first, first, last))
+        spans.append((position, position + last - first, first, last, flagged))
         position += last - first
         source_end = last
     return spans
 
 
-def write_fcp_xml(media_path: str, keep_blocks: List[Tuple[float, float]], xml_path: str, name: str) -> int:
-    """写 FCP7 XML，结构与 Premiere 自己导出的一致。返回序列里的片段数。"""
+def _sequence_frame(spans: List[Tuple[int, int, int, int, bool]], source_frame: int) -> int:
+    """素材里的一帧在序列里的位置。它被剪掉时，取它后面第一个保留片段的开头：那就是剪切处。"""
+    for start, end, first, last, _ in spans:
+        if source_frame < last:
+            return start + max(0, source_frame - first)
+    return spans[-1][1]
+
+
+def _markers(checks: List[Dict], spans: List[Tuple[int, int, int, int, bool]], fps: fractions.Fraction,
+             offset: float) -> List[Dict]:
+    """把要人工先看的地方变成序列标记：name、comment、start / end（序列帧；点标记的 end 为 -1）。"""
+    markers = []
+    for check in checks:
+        start = _sequence_frame(spans, round((check["start"] + offset) * fps))
+        end = -1
+        if check["kind"] == "flag":
+            end = _sequence_frame(spans, round((check["end"] + offset) * fps))
+            if end <= start:
+                continue  # 这一段没有进序列（比一帧还短）
+        text = check["text"] if len(check["text"]) <= MARKER_TEXT_CHARS else check["text"][:MARKER_TEXT_CHARS] + "…"
+        markers.append({"name": ("Cut: " if check["kind"] == "cut" else "Check: ") + check["why"],
+                        "comment": text, "start": start, "end": end})
+    return markers
+
+
+def write_fcp_xml(media_path: str, keep_blocks: List[Tuple[float, float]], xml_path: str, name: str,
+                  checks: Optional[List[Dict]] = None) -> Tuple[int, List[Dict]]:
+    """写 FCP7 XML，结构与 Premiere 自己导出的一致。返回 (序列里的片段数, 序列标记)。
+
+    checks 是要人工先看的地方（见模块说明）。标记里的 start / end 另外带一份秒数（start_sec / end_sec），
+    导入 XML 之后标记没有跟过来时，用它在 Premiere 里补建。
+    """
     info = _probe_media(media_path)
     video, audio = info["video"], info["audio"]
     timebase, ntsc = _timeline_rate(video)
@@ -96,9 +163,16 @@ def write_fcp_xml(media_path: str, keep_blocks: List[Tuple[float, float]], xml_p
     total_frames = int(round(info["duration"] * fps))
     ticks_per_frame = int(TICKS_PER_SECOND / fps)
     offset = info["audio_offset"]
-    spans = _frame_spans([(start + offset, end + offset) for start, end in keep_blocks], fps, total_frames)
+    checks = checks or []
+    pieces = _split_at_flags([(start + offset, end + offset) for start, end in keep_blocks],
+                             [(c["start"] + offset, c["end"] + offset) for c in checks if c["kind"] == "flag"])
+    spans = _frame_spans(pieces, fps, total_frames)
     if not spans:
         raise RuntimeError("No keep blocks for the Premiere sequence.")
+    markers = _markers(checks, spans, fps, offset)
+    for marker in markers:
+        marker["start_sec"] = float(marker["start"] / fps)
+        marker["end_sec"] = float(marker["end"] / fps) if marker["end"] > 0 else -1.0
 
     channels = int(audio.get("channels") or 2) if audio else 0
     stereo = channels == 2
@@ -144,14 +218,15 @@ def write_fcp_xml(media_path: str, keep_blocks: List[Tuple[float, float]], xml_p
         return file_full
 
     def _clip(clip_id: str, attrs: str, media_type: str, source_track: int, n: int, span, extra: str = "") -> str:
-        start, end, first, last = span
+        start, end, first, last, flagged = span
+        label = "<labels><label2>%s</label2></labels>" % FLAG_LABEL if flagged else ""
         return ('<clipitem id="%s"%s><masterclipid>masterclip-1</masterclipid><name>%s</name><enabled>TRUE</enabled>'
                 '<duration>%d</duration>%s<start>%d</start><end>%d</end><in>%d</in><out>%d</out>'
                 '<pproTicksIn>%d</pproTicksIn><pproTicksOut>%d</pproTicksOut>%s%s'
-                '<sourcetrack><mediatype>%s</mediatype><trackindex>%d</trackindex></sourcetrack>%s</clipitem>'
+                '<sourcetrack><mediatype>%s</mediatype><trackindex>%d</trackindex></sourcetrack>%s%s</clipitem>'
                 % (clip_id, attrs, clip_name, total_frames, rate, start, end, first, last,
                    first * ticks_per_frame, last * ticks_per_frame, extra, _file_element(),
-                   media_type, source_track, _links(n)))
+                   media_type, source_track, _links(n), label))
 
     video_track = ""
     if video:
@@ -176,15 +251,18 @@ def write_fcp_xml(media_path: str, keep_blocks: List[Tuple[float, float]], xml_p
 
     outputs = "".join("<group><index>%d</index><numchannels>1</numchannels><downmix>0</downmix>"
                       "<channel><index>%d</index></channel></group>" % (i, i) for i in (1, 2))
+    marker_items = "".join("<marker><comment>%s</comment><name>%s</name><in>%d</in><out>%d</out></marker>"
+                           % (escape(m["comment"]), escape(m["name"]), m["start"], m["end"]) for m in markers)
     doc = ('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n<xmeml version="4">'
            '<sequence id="sequence-1"><name>%s</name><duration>%d</duration>%s<in>-1</in><out>-1</out>%s'
            '<media><video><format>%s</format>%s</video>'
            '<audio><numOutputChannels>2</numOutputChannels><format>%s</format><outputs>%s</outputs>%s</audio></media>'
-           '</sequence></xmeml>\n'
-           % (escape(name), spans[-1][1], rate, timecode, video_format, video_track, audio_format, outputs, audio_tracks))
+           '%s</sequence></xmeml>\n'
+           % (escape(name), spans[-1][1], rate, timecode, video_format, video_track, audio_format, outputs, audio_tracks,
+              marker_items))
     with open(xml_path, "w", encoding="utf-8") as f:
         f.write(doc)
-    return len(spans)
+    return len(spans), markers
 
 
 def find_premiere() -> Optional[str]:
@@ -211,13 +289,53 @@ def premiere_running() -> bool:
 
 _IMPORT_SCRIPT = r"""
 (function () {
-  var XML_PATH = %(xml)s, PROJECT_PATH = %(project)s, STATUS_PATH = %(status)s;
+  var XML_PATH = %(xml)s, PROJECT_PATH = %(project)s, STATUS_PATH = %(status)s, MARKERS = %(markers)s;
   function report(line) {
     var f = new File(STATUS_PATH);
     f.encoding = "UTF-8";
     f.open("a");
     f.writeln(line);
     f.close();
+  }
+  // Sequence markers come from the XML. If the import dropped them, create them here.
+  // Whatever goes wrong only costs markers, never the project.
+  function ensureMarkers(seq) {
+    var have = -1, how = "imported";
+    try {
+      have = seq.markers.numMarkers;
+      if (have === 0) {
+        how = "created";
+        for (var i = 0; i < MARKERS.length; i++) {
+          try {
+            var marker = seq.markers.createMarker(MARKERS[i].start_sec);
+            marker.name = MARKERS[i].name;
+            marker.comments = MARKERS[i].comment;
+            if (MARKERS[i].end_sec > MARKERS[i].start_sec) { setMarkerEnd(marker, MARKERS[i].end_sec); }
+          } catch (e) {
+            report("MARKERS_ERR marker " + i + ": " + e);
+          }
+        }
+        have = seq.markers.numMarkers;
+      }
+    } catch (e2) {
+      report("MARKERS_ERR " + e2);
+    }
+    return have + " " + how;
+  }
+  // A marker's end takes seconds as a number in Premiere 2025 ("Illegal Parameter type" for a Time object).
+  // Other versions document a Time object, so that is tried second. If both fail the marker stays a point.
+  function setMarkerEnd(marker, seconds) {
+    try {
+      marker.end = seconds;
+    } catch (e) {
+      try {
+        var end = new Time();
+        end.seconds = seconds;
+        marker.end = end;
+      } catch (e2) {
+        report("MARKERS_ERR end: " + e + " / " + e2);
+      }
+    }
   }
   try {
     if (!app.newProject(PROJECT_PATH)) { throw new Error("could not create the project"); }
@@ -232,6 +350,7 @@ _IMPORT_SCRIPT = r"""
     report("CLIPS " + video + " " + audio);
     var firstClip = video ? seq.videoTracks[0].clips[0] : (audio ? seq.audioTracks[0].clips[0] : null);
     if (firstClip && firstClip.projectItem.isOffline()) { throw new Error("OFFLINE"); }
+    if (MARKERS.length) { report("MARKERS " + ensureMarkers(seq)); }
     if (!app.project.save()) { throw new Error("could not save the project"); }
     $.sleep(1000);
     report("OK");
@@ -260,9 +379,12 @@ def _stop_process(proc: subprocess.Popen) -> None:
 
 
 def convert_to_prproj(exe: str, xml_path: str, project_path: str, clip_count: int, has_video: bool,
-                      has_audio: bool, work_dir: str, log: Callable[[str], None] = print) -> None:
+                      has_audio: bool, work_dir: str, log: Callable[[str], None] = print,
+                      markers: Optional[List[Dict]] = None) -> Optional[int]:
     """启动 Premiere，导入 XML 并存成 project_path，然后退出。失败时抛 RuntimeError，不留下半成品。
 
+    markers 是 XML 里的序列标记（见 write_fcp_xml）。返回存好的序列里有几个标记；没有标记要加、
+    或者 Premiere 没有报告数量时返回 None。
     调用前必须确认 Premiere 没在运行：/C es.processFile 对已打开的 Premiere 不起作用。
     """
     status_path = os.path.join(work_dir, "premiere_status.txt")
@@ -270,6 +392,8 @@ def convert_to_prproj(exe: str, xml_path: str, project_path: str, clip_count: in
     # json.dumps 产出合法的脚本字符串，非 ASCII 字符转义后不受脚本文件编码影响
     paths = {key: json.dumps(value.replace("\\", "/"))
              for key, value in (("xml", xml_path), ("project", project_path), ("status", status_path))}
+    paths["markers"] = json.dumps([{key: m[key] for key in ("name", "comment", "start_sec", "end_sec")}
+                                   for m in markers or []])
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(_IMPORT_SCRIPT % paths)
 
@@ -311,6 +435,11 @@ def convert_to_prproj(exe: str, xml_path: str, project_path: str, clip_count: in
     except subprocess.TimeoutExpired:
         log("premiere: did not exit in time, stopping it")
         _stop_process(proc)
+    found = next((line.split() for line in lines if line.startswith("MARKERS ")), None)
+    try:
+        return int(found[1]) if found else None
+    except (IndexError, ValueError):
+        return None
 
 
 def _remove_partial_project(project_path: str) -> None:
@@ -325,14 +454,16 @@ def _remove_partial_project(project_path: str) -> None:
 
 
 def export_project(media_path: str, keep_blocks: List[Tuple[float, float]], out_stem: str, work_dir: str,
-                   log: Callable[[str], None] = print) -> Tuple[Optional[str], Optional[str]]:
+                   log: Callable[[str], None] = print,
+                   checks: Optional[List[Dict]] = None) -> Tuple[Optional[str], Optional[str]]:
     """输出 Premiere 工程，返回 (文件路径, 警告)。优先 .prproj，做不到时交付 .xml 并在警告里说明原因和做法。
 
+    checks 是要人工先看的地方（见模块说明），在序列里做成标记和换了颜色的片段。
     Premiere 读不了素材时不交付工程（路径为 None）：导入 XML 也只会得到离线片段。
     """
     name = os.path.basename(out_stem)
     xml_tmp = os.path.join(work_dir, name + ".xml")
-    clip_count = write_fcp_xml(media_path, keep_blocks, xml_tmp, name)
+    clip_count, markers = write_fcp_xml(media_path, keep_blocks, xml_tmp, name, checks)
     info = _probe_media(media_path)
     if info["audio_offset"] >= 0.001:
         log("premiere: the audio starts %.3f s into the file, so the sequence times are shifted by that much"
@@ -346,7 +477,12 @@ def export_project(media_path: str, keep_blocks: List[Tuple[float, float]], out_
         reason = "Premiere is open, and it can only be driven when it starts fresh. Close it before the next run to get a .prproj"
     else:
         try:
-            convert_to_prproj(exe, xml_tmp, project_path, clip_count, bool(info["video"]), bool(info["audio"]), work_dir, log)
+            found = convert_to_prproj(exe, xml_tmp, project_path, clip_count, bool(info["video"]),
+                                      bool(info["audio"]), work_dir, log, markers)
+            if markers and (found is None or found <= 0):
+                return project_path, ("The Premiere project was created, but the %d markers for the passages to check "
+                                      "could not be added. The same places are listed at the top of the cut list."
+                                      % len(markers))
             return project_path, None
         except SourceUnreadable:
             return None, ("No Premiere project was created: Premiere cannot read this file format (MKV is a common case). "
