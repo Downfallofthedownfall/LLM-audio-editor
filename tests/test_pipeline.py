@@ -249,9 +249,9 @@ class CheckPointsTest(_Patched):
         points = dedup._check_points(tokens)
         dedup.write_cut_list(tokens, keep, path, "en", (dedup._line_check_summary(points), ""), points)
         text = _read(path)
-        self.assertIn("Line check: cut 1 passage that is off-script or an earlier take of something said again later, "
-                      "and kept 1 passage that may be off-script or an earlier take, for you to check.", text)
-        self.assertIn("Check first (2 places):", text)
+        self.assertIn("Line check: cut 1 passage (off-script remarks and earlier takes of something said again later); "
+                      "kept and marked 1 passage it was less sure about.", text)
+        self.assertIn("Check first (2 places;", text)
         self.assertIn("cut: off-script and earlier take", text)
         self.assertIn("[=Oh no.=]", text)
         self.assertIn("[-uh-] [=Wrong one.=]", text)
@@ -259,6 +259,39 @@ class CheckPointsTest(_Patched):
         rows = dedup._win_lines(tokens, 0, len(tokens), " ", dedup._cut_indices(tokens))
         self.assertIn("  2  OFF  Oh", rows)
         self.assertIn("  4  DEL  uh", rows)
+
+    def test_take_mode_decides_what_is_cut(self):
+        cut, flag = {1: "off", 2: "off", 5: "retake"}, {8: "unsure", 9: "retake"}
+        self.assertEqual(dedup._apply_take_mode(cut, flag, "cut"),
+                         ({1: "off", 2: "off"}, {8: "unsure", 9: "retake", 5: "sure_retake"}))
+        self.assertEqual(dedup._apply_take_mode(cut, flag, "cut_takes"), (cut, flag))
+        self.assertEqual(dedup._apply_take_mode(cut, flag, "mark"),
+                         ({}, {8: "unsure", 9: "retake", 1: "sure_off", 2: "sure_off", 5: "sure_retake"}))
+        self.assertEqual((cut, flag), ({1: "off", 2: "off", 5: "retake"}, {8: "unsure", 9: "retake"}))
+
+    def test_default_mode_marks_an_agreed_earlier_take_without_a_question_mark(self):
+        words = _words(("Keep", 0, .4), ("this.", .5, .9), ("Oh", 2, 2.2), ("no.", 2.3, 2.6), ("First", 3, 3.3),
+                       ("try.", 3.4, 3.7), ("Maybe", 3.8, 4.1), ("this.", 4.2, 4.5), ("Second", 6, 6.3), ("try.", 6.4, 6.8))
+        takes, flags = dedup._apply_take_mode({2: "off", 3: "off", 4: "retake", 5: "retake"}, {6: "retake", 7: "retake"}, "cut")
+        tokens = dedup._edit_tokens(words, set(), set(), takes, flags)
+        self.assertEqual([t["cut"] for t in tokens], [None, None, "off", "off"] + [None] * 6)
+        points = dedup._check_points(tokens)
+        self.assertEqual([(p["kind"], p["why"], p["text"]) for p in points],
+                         [("cut", "off-script", "Oh no."), ("flag", "earlier take", "First try."),
+                          ("flag", "earlier take?", "Maybe this.")])
+        self.assertEqual(points[1]["end"], points[2]["start"])  # 两个片段首尾相接，把握不同所以分开
+        self.assertEqual(dedup._line_check_summary(points),
+                         "Line check: cut 1 passage (off-script remarks); kept and marked 1 passage that both readings "
+                         "would cut (earlier takes of something said again later); kept and marked 1 passage it was "
+                         "less sure about. They are listed at the top of the cut list and marked in the Premiere sequence.")
+        keep = dedup.clean_keep_blocks(tokens, dedup._cut_indices(tokens), keep_gap=0.8)
+        path = os.path.join(self.tmp.name, "cuts.txt")
+        dedup.write_cut_list(tokens, keep, path, "en", (), points)
+        text = _read(path)
+        self.assertIn("kept: earlier take ", text)
+        self.assertIn("kept: earlier take? ", text)
+        for marked in ("[=Oh no.=]", "[?First try.?]", "[?Maybe this.?]"):
+            self.assertIn(marked, text)
 
     def test_edit_record_round_trip(self):
         tokens = self._tokens()

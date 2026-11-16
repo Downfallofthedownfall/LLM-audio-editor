@@ -4,7 +4,7 @@
   2) 规则清理：括号声音标记、无歧义语气词（精确、无需模型）
   3) LLM（OpenAI 兼容，chat.completions / responses 端点）逐词判定口误，返回要删除的词索引
   4) 按句判定：LLM 通读删掉口误之后剩下的内容，找出整句该剪的行（画外话、后面又重说了一遍的前一版）。
-     读两遍，都认定的才剪，其余的留在成片里并做上标记，交给人工确认
+     读两遍。默认只剪两遍都认定的画外话；前一版和拿不准的行留在成片里并做上标记，交给人工决定
   5) 听成片复核：把剪好的结果拼出来重新逐字转写，和计划保留的词对齐，修掉只有听才能发现的问题
      （被删词漏进来的残音、被切断的词、第一次转写漏掉的口误），再由 LLM 读实际听到的内容，恢复误删、补删漏删
   6) ffmpeg 流式解码 → 只保留选中区间 → 流式编码，内存占用与时长无关
@@ -1392,7 +1392,10 @@ _LINE_PAUSE_NOTE_SEC = 2.0   # 行前的沉默不短于这么久，才在提示�
 # 窗口比逐词判定大：一行只占提示词的一行，而整段重说可能隔着好几句话
 _TAKE_WINDOW_WORDS, _TAKE_CONTEXT_WORDS = 600, 300
 TAKE_READINGS = 2            # 每一行读几遍（各遍的窗口边界互相错开）。每一遍都认定该剪才剪，否则只做标记
-TAKE_MODES = ("cut", "mark", "off")  # 认定的行：剪掉 / 只做标记不剪 / 不做按句判定
+# 认定的行怎么处理：只剪画外话、前一版做标记（默认）/ 两类都剪 / 都只做标记 / 不做按句判定。见 _apply_take_mode
+TAKE_MODES = ("cut", "cut_takes", "mark", "off")
+# 各遍都认定该剪、只是因为 take_mode 才留下的行，flag 的值加上这个前缀，和只有一遍认定的区别开
+_SURE = "sure_"
 
 
 def _lines(words: List[Dict], del_set: Set[int]) -> List[List[int]]:
@@ -1465,10 +1468,11 @@ def llm_judge_lines(words: List[Dict], del_set: Set[int], llm, progress=None, la
                     span: Tuple[float, float] = (0.51, 0.55)
                     ) -> Tuple[Dict[int, str], Dict[int, str], List[Tuple[str, str]], int]:
     """按句判定：读删掉口误之后剩下的内容，找出整行该剪的：画外话（off）和后面又说了一遍的前一版（retake）。
-    返回 ({词下标: 原因} 要剪的, {词下标: 原因} 留下但存疑的, 失败窗口的 (时间范围, 错误), 窗口总数)。
+    返回 ({词下标: 原因} 各遍都认定该剪的, {词下标: 原因} 存疑的, 失败窗口的 (时间范围, 错误), 窗口总数)。
+    第一项里哪些真的剪掉由 take_mode 决定（见 _apply_take_mode），其余的和第二项一样只做标记。
 
     每一行读 TAKE_READINGS 遍，各遍的窗口边界互相错开，同一行每次都和不同的上下文一起读。
-    每一遍都认定该剪的行才剪；只有一部分认定、或者模型自己说拿不准的行留在成片里，标成存疑交给人工确认：
+    每一遍都认定该剪的行才可能剪；只有一部分认定、或者模型自己说拿不准的行留在成片里，标成存疑交给人工确认：
     整句误删很难发现（成片里少一句话并不显眼），漏删一听就知道，所以拿不准时宁可留着。
     前一版要指明取代它的后一行，而且那一行必须留在成片里：同一段内容的各版不会全被剪掉。
     只有一个窗口的短录音，各遍读到的内容完全相同，只是同一个问题问了两次：这样的核对比换一段上下文再读要弱。
@@ -1551,6 +1555,22 @@ def llm_judge_lines(words: List[Dict], del_set: Set[int], llm, progress=None, la
          % (len(lines), len(cut_lines), len(cut), len(set().union(maybe, *sure)) - len(cut_lines), len(flag),
             len(failures), len(windows)))
     return cut, flag, failures, len(windows)
+
+
+def _apply_take_mode(cut: Dict[int, str], flag: Dict[int, str], mode: str) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """按 take_mode 决定各遍都认定的行（cut）哪些真的剪掉，返回 (要剪的词, 只做标记的词)。
+
+    默认的 "cut" 只剪画外话，前一版只做标记。依据是一次实测（85 分钟口播，按句判定由 Claude Opus 5.5 作答，
+    对照人工修正过的工程）：画外话剪了 77 行，没有一行是人工保留的；前一版剪了 33 行，其中约四分之一的词人工保留了
+    （说话人确实说了两遍，剪辑者两遍都留下了）。前一版留哪一遍是取舍，不是对错，而且比 Opus 弱的模型只会判得更差，
+    所以交给人决定。"cut_takes" 连前一版一起剪，"mark" 两类都不剪。
+    因为这个设置才没剪的行，标记值加上 _SURE 前缀：它是各遍都认定的，比只有一遍认定的更值得先看。
+    """
+    cut_whys = {"cut": ("off",), "cut_takes": _TAKE_CUTS, "mark": ()}[mode]
+    cuts = {i: why for i, why in cut.items() if why in cut_whys}
+    marks = dict(flag)
+    marks.update((i, _SURE + why) for i, why in cut.items() if why not in cut_whys)
+    return cuts, marks
 
 
 # ---- 用真实音频校准切点 ----
@@ -2248,62 +2268,70 @@ def _review_summary(totals: collections.Counter) -> str:
 
 
 def _check_points(tokens: List[Dict], language: str = "en") -> List[Dict]:
-    """值得人工先看的地方，按时间排序：整行剪掉的（kind 为 "cut"）和留在成片里但存疑的（kind 为 "flag"）。
+    """值得人工先看的地方，按时间排序：整行剪掉的（kind 为 "cut"）和留在成片里做了标记的（kind 为 "flag"）。
 
-    每一项有 kind、why（给人看的原因）、start / end（素材秒）和 text。相邻的同类行合成一项；
-    中间夹着的其他被删词（口误、残音）不算间隔，也不进 text。
-    存疑片段的 start / end 取它和前后词之间的中点：Premiere 工程在这里把片段切开，
+    每一项有 kind、why（给人看的原因）、start / end（素材秒）和 text。why 以问号结尾表示把握不大：
+    只有一遍认定，或者模型自己说拿不准。各遍都认定、只是按设置没剪的（flag 带 _SURE 前缀），why 不带问号。
+    相邻的同类行合成一项，把握不同的分开；中间夹着的其他被删词（口误、残音）不算间隔，也不进 text。
+    做了标记的片段，start / end 取它和前后词之间的中点：Premiere 工程在这里把片段切开，
     用户删掉这一段之后，它前后的停顿各留下一半。
     """
     sep = _word_sep(language)
     groups: List[Tuple[str, List[int]]] = []
     current: Optional[Tuple[str, List[int]]] = None
     for i, t in enumerate(tokens):
-        cut = t.get("cut")
-        kind = "cut" if cut in _TAKE_CUTS else "flag" if not cut and t.get("flag") else None
-        if kind is None:
+        cut, flag = t.get("cut"), t.get("flag") or ""
+        group = "cut" if cut in _TAKE_CUTS else None if cut or not flag else "sure" if flag.startswith(_SURE) else "unsure"
+        if group is None:
             if not cut:  # 正常保留的词把前后隔开
                 current = None
             continue
-        if current is None or current[0] != kind:
-            current = (kind, [])
+        if current is None or current[0] != group:
+            current = (group, [])
             groups.append(current)
         current[1].append(i)
 
     points = []
-    for kind, idxs in groups:
+    for group, idxs in groups:
         a, b = idxs[0], idxs[-1]
-        whys = {tokens[i]["cut"] if kind == "cut" else tokens[i]["flag"] for i in idxs}
+        whys = {tokens[i]["cut"] if group == "cut" else tokens[i]["flag"].replace(_SURE, "", 1) for i in idxs}
         why = ("off-script" if whys == {"off"} else "earlier take" if whys == {"retake"}
-               else "off-script and earlier take" if kind == "cut" else "off-script or earlier take")
+               else "off-script or earlier take" if group == "unsure" else "off-script and earlier take")
         start, end = float(tokens[a]["start"]), float(tokens[b]["end"])
-        if kind == "flag":
+        if group == "unsure":
             why += "?"
+        if group != "cut":
             start = (float(tokens[a - 1]["end"]) + start) / 2 if a else 0.0
             end = (end + float(tokens[b + 1]["start"])) / 2 if b + 1 < len(tokens) else end + 1.0
-        points.append({"kind": kind, "why": why, "start": round(start, 3), "end": round(max(start, end), 3),
-                       "text": sep.join(tokens[i]["word"].strip() for i in idxs)})
+        points.append({"kind": "cut" if group == "cut" else "flag", "why": why, "start": round(start, 3),
+                       "end": round(max(start, end), 3), "text": sep.join(tokens[i]["word"].strip() for i in idxs)})
     return points
 
 
 def _line_check_summary(points: List[Dict]) -> str:
     """一句话说明按句判定做了什么，给页面和剪辑清单用。"""
-    cut = sum(1 for p in points if p["kind"] == "cut")
-    flagged = len(points) - cut
     if not points:
         return ""
 
     def _count(n: int) -> str:
         return "%d %s" % (n, "passage" if n == 1 else "passages")
 
+    cut = [p for p in points if p["kind"] == "cut"]
+    sure = [p for p in points if p["kind"] == "flag" and not p["why"].endswith("?")]
+    unsure = len(points) - len(cut) - len(sure)
+    takes = "earlier takes of something said again later"
     parts = []
     if cut:
-        parts.append("cut %s that %s off-script or an earlier take of something said again later"
-                     % (_count(cut), "is" if cut == 1 else "are"))
-    if flagged:
-        parts.append("kept %s that may be off-script or an earlier take, for you to check" % _count(flagged))
+        parts.append("cut %s (%s)" % (_count(len(cut)), "off-script remarks" if all(p["why"] == "off-script" for p in cut)
+                                      else "off-script remarks and " + takes))
+    if sure:
+        parts.append("kept and marked %s that both readings would cut (%s)"
+                     % (_count(len(sure)), takes if all(p["why"] == "earlier take" for p in sure)
+                        else "off-script remarks and " + takes))
+    if unsure:
+        parts.append("kept and marked %s it was less sure about" % _count(unsure))
     return ("Line check: %s. They are listed at the top of the cut list and marked in the Premiere sequence."
-            % ", and ".join(parts))
+            % "; ".join(parts))
 
 
 def write_cut_list(tokens: List[Dict], keep: List[Tuple[float, float]], path: str, language: str = "en",
@@ -2331,7 +2359,7 @@ def write_cut_list(tokens: List[Dict], keep: List[Tuple[float, float]], path: st
                 "  [-like this-]    deleted by the first pass: mis-speaks, restarts, repeats and filler sounds\n"
                 "  [=like this=]    whole lines cut by the line check: off-script remarks, or an earlier take of "
                 "something said again later\n"
-                "  [?like this?]    kept, but the line check suspects it is off-script or an earlier take\n"
+                "  [?like this?]    kept, but the line check thinks it is off-script or an earlier take: your call\n"
                 "  [--like this--]  deleted by the review (%d words): mis-speaks the first pass missed, and leftover "
                 "sounds heard at the cuts\n"
                 "  [+like this+]    deleted by the first pass, kept by the review (%d words)\n" % (added, restored))
@@ -2339,7 +2367,8 @@ def write_cut_list(tokens: List[Dict], keep: List[Tuple[float, float]], path: st
             if note:
                 f.write(note + "\n")
         if points:
-            f.write("\nCheck first (%d places):\n" % len(points))
+            f.write("\nCheck first (%d places; a ? means only one of the two readings named it, or it was not sure):\n"
+                    % len(points))
             for p in points:
                 f.write("  %s  %s  %-34s %s\n" % (_timecode(timeline.to_edit(p["start"])), _timecode(p["start"]),
                                                   ("cut: " if p["kind"] == "cut" else "kept: ") + p["why"], p["text"]))
@@ -2380,8 +2409,8 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
                 progress=None, api_mode: str = "auto", review_passes: int = REVIEW_PASSES,
                 take_mode: str = "cut", *, work_dir: str) -> Dict:
     """去重：只保留有文字的段落(词所在区域)，再减去语气词和 LLM 判重标记的词；无文字(静音)自然被切掉。
-    接着按句判定（llm_judge_lines）：找出整行的画外话和后面重说过的前一版。take_mode 为 "cut" 时剪掉认定的行，
-    "mark" 时只做标记不剪，"off" 时跳过这一步。
+    接着按句判定（llm_judge_lines）：找出整行的画外话和后面重说过的前一版。take_mode 决定认定的行怎么处理
+    （见 _apply_take_mode）："cut" 只剪画外话、前一版做标记，"cut_takes" 两类都剪，"mark" 都只做标记，"off" 跳过这一步。
     然后听成片（review_edit）：把剪好的结果重新转写 review_passes 遍，修掉只有听才能发现的问题。
 
     返回结果里的 warnings 列出没有完全按要求完成的部分（如 LLM 窗口失败），需要展示给用户。
@@ -2448,8 +2477,7 @@ def dedup_audio(audio_path: str, out_wav: str, api_url: str, model: str, api_key
                             "these parts of the source may remain or are only marked: %s. First error: %s"
                             % (len(take_failures), take_windows, ", ".join(sorted({where for where, _ in take_failures})),
                                take_failures[0][1]))
-        if take_mode == "mark":
-            takes, flags = {}, {**flags, **takes}
+        takes, flags = _apply_take_mode(takes, flags, take_mode)
 
     # 第二轮：听成片。切点从这里开始就校准到真实音频的空隙上，听到的和最后交付的是同一种切法
     _report(progress, 0.55, "Measuring loudness to place the cut points…")
@@ -2533,7 +2561,8 @@ if __name__ == "__main__":
     ap.add_argument("--whisper", default="large")
     ap.add_argument("--review-passes", type=int, choices=[1, 2, 3], default=REVIEW_PASSES)
     ap.add_argument("--take-mode", choices=TAKE_MODES, default="cut",
-                    help="off-script lines and earlier takes: cut them, only mark them, or skip the line check")
+                    help="line check: cut off-script lines and mark earlier takes (cut), cut both (cut_takes), "
+                         "only mark both (mark), or skip it (off)")
     a = ap.parse_args()
     # 输出容器跟随 --out 的扩展名，否则 AAC 源配 b.wav 会写出内容与扩展名不符的文件
     out_ext = os.path.splitext(a.out)[1].lower().lstrip(".")

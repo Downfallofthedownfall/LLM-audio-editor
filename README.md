@@ -30,8 +30,9 @@ parts.
    sentence per line, as an editor would, and looks for whole lines that do not belong in the
    video: the speaker talking to themselves (`my god it's laggy, why?`), notes about the recording
    (`I'll record the voice after`), and an earlier take of something that is said again later in
-   other words. Every line is read twice, each time with different surrounding text. A line is cut
-   only when both readings agree. The rest stay in the edit and are marked for you to check.
+   other words. Every line is read twice, each time with different surrounding text. An off-script
+   line is cut when both readings name it. Earlier takes, and lines that only one reading names,
+   stay in the edit and are marked: which take to keep is your call.
 6. **Re-assembly** — keeps only the non-deleted words (deleted words break the block) and
    snaps each cut to a real gap in the audio, because word timestamps alone clip endings and
    let the tail of a deleted word through.
@@ -88,12 +89,25 @@ audio/video ──ffmpeg──▶ 16 kHz mono ──CrisperWhisper (verbatim)─
   see. It exists because of a measurement. On an 85-minute recording that was then corrected by
   hand in Premiere, the per-word pass had removed 1,624 of the 2,591 words that had to go (63%),
   and none of its deletions was put back. The 967 words it left were in 79 places, almost all of
-  them off-script remarks or earlier takes of a whole sentence. How many of these the line check
-  finds depends on the LLM and has not been measured yet: `evaluate.py` measures it once you have
-  corrected a project (see below).
-- **A short list to check instead of the whole edit**: every line the line check cut, and every
-  line it was not sure about, has a marker in the Premiere sequence and an entry at the top of the
-  cut list.
+  them off-script remarks or earlier takes of a whole sentence.
+
+  The line check was then measured on the same recording, with Claude Opus 5.5 answering it and
+  the per-word pass unchanged:
+
+  | Line check setting | Words found | Wrongly removed | Missed words that carry a mark |
+  |---|---|---|---|
+  | off | 63% | none | none |
+  | cut off-script, mark earlier takes (default) | 78% | none | 63% |
+  | cut both | 90% | 101 words in 5 places | 23% |
+
+  All 77 off-script lines it cut had also been removed by hand. Of the earlier takes it would
+  cut, a quarter of the words had been kept by hand: the speaker did say the thing twice, and the
+  editor kept both. That is a matter of taste, so by default earlier takes are marked and not cut.
+  These numbers are for Opus 5.5. A weaker model will find less and misjudge more, and the line
+  check has not been measured with DeepSeek: `evaluate.py` measures it once you have corrected a
+  project (see below).
+- **A short list to check instead of the whole edit**: every line the line check cut or marked
+  has a marker in the Premiere sequence and an entry at the top of the cut list.
 - **No residue / no clicks**: deleted segments are removed entirely, including their
   cut-padding edges.
 - **The result is listened to, not only read**: the edit is transcribed again and compared
@@ -191,14 +205,18 @@ is loaded **offline**.
     with 300 words of context, and the windows of the second reading start half a window later.
     A recording short enough to fit in one window is asked the same question twice instead,
     which is a weaker check.
-  - A line is cut only when every reading would cut it. A line that only one reading would cut, or
-    that a reading lists as unsure, stays in the edit and is marked. A missing sentence is hard to
-    notice in the finished video and a leftover one is easy to hear, so in doubt the line stays.
-  - An earlier take is cut only if the line that replaces it stays, so the takes of one passage are
-    never all cut.
+  - A line can be cut only when every reading would cut it. A line that only one reading would
+    cut, or that a reading lists as unsure, stays in the edit and is marked. A missing sentence is
+    hard to notice in the finished video and a leftover one is easy to hear, so in doubt the line
+    stays.
+  - The web form decides what happens to the lines every reading would cut:
+    - **Cut off-script remarks, mark earlier takes** (default). Which of two takes to keep is a
+      matter of taste, and it is where the model was wrong in the measurement above.
+    - **Cut both**. An earlier take is cut only if the line that replaces it stays, so the takes
+      of one passage are never all cut.
+    - **Only mark them**. Nothing is cut.
+    - **Off**. The edit is the same as before the line check existed.
   - The LLM review cannot restore a line cut here.
-  - The web form has three settings: cut and mark (default), only mark, or off. With "off" the
-    edit is the same as before the line check existed.
 - **Saved LLM replies**: a reply that passed the checks is saved in `.work\llm_cache\`, keyed by
   the API URL, the model, the request settings and the full request text. Running the same file
   again with the same settings reuses the replies, so the result is the same. Delete the folder to
@@ -261,13 +279,17 @@ Then open **http://127.0.0.1:7861**.
   linked video and audio clip, for easy manual correction.
 - The sequence has a marker at every place the line check touched. Jump between them with
   `Shift+M` and `Ctrl+Shift+M`:
-  - **`Cut: off-script`** / **`Cut: earlier take`** sits on the cut where whole lines were removed.
-    The marker's comment holds the removed text. To bring it back, drag the edge of the clip next
-    to the marker outwards.
-  - **`Check: …?`** spans a passage that was kept although the line check suspects it. The passage
-    is a clip of its own, with the Mango label colour, so you can select it and ripple-delete it.
-    Its edges sit in the middle of the pauses around it. If you renamed Premiere's label colours,
-    the clip keeps the default colour and only the marker shows it.
+  - **`Cut: off-script`** (and **`Cut: earlier take`** with the "cut both" setting) sits on the cut
+    where whole lines were removed. The marker's comment holds the removed text. To bring it back,
+    drag the edge of the clip next to the marker outwards.
+  - **`Check: earlier take`** spans a passage that both readings would cut and that was kept for
+    you to decide. Its comment holds the text. The speaker says the same thing again shortly
+    after, so keep whichever take you prefer.
+  - **`Check: …?`** with a question mark spans a passage that only one reading named, or that the
+    model was unsure about. These are right less often.
+  - A marked passage is a clip of its own, with the Mango label colour, so you can select it and
+    ripple-delete it. Its edges sit in the middle of the pauses around it. If you renamed
+    Premiere's label colours, the clip keeps the default colour and only the marker shows it.
 - The same places are listed under "Check first" at the top of the cut list.
 - The markers and the label colour travel in the XML. This was checked with Premiere Pro 2025:
   both come through the import. If a Premiere version drops the markers on import, the tool
@@ -406,6 +428,8 @@ Root Folder
 - **The line check cut something that belongs in the video** — find its `Cut:` marker in the
   sequence and drag the clip edge back out. If it happens often with your material, choose "Only
   mark them" in the form, and tell the rules in `TAKE_RULES` (`dedup.py`) what to keep.
+- **Too many earlier takes are left for you to remove** — with a strong model, choose "Cut both"
+  in the form. Check the `Cut: earlier take` markers afterwards.
 - **Warning: "the N markers for the passages to check could not be added"** — the project itself
   is complete. Use the "Check first" list at the top of the cut list instead.
 - **Warning: "The LLM review failed for N of M windows in pass P"** — the cuts in the listed time

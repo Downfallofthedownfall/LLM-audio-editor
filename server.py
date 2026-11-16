@@ -155,7 +155,8 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div><label>Silence gap (seconds, larger = keep more pauses, cut less)</label><input name="keep_gap" type="number" value="0.8" step="0.1" min="0.1" max="3"></div>
  </div>
  <label>Line check: off-script remarks and earlier takes of something said again later</label><select name="take_mode">
-   <option value="cut" selected>Cut them when two readings agree, mark the rest to check (default)</option>
+   <option value="cut" selected>Cut off-script remarks, mark earlier takes for you to decide (default)</option>
+   <option value="cut_takes">Cut both: off-script remarks and earlier takes</option>
    <option value="mark">Only mark them, cut nothing</option>
    <option value="off">Off (only remove mis-speaks)</option>
  </select>
